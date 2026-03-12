@@ -257,37 +257,44 @@ def find_nearest_z(pt_2d, points_3d, radius):
     return best_z
 
 
+def polyline_dist(pts, from_idx, to_idx):
+    """Sum of segment-by-segment 2D distances along a polyline from from_idx to to_idx."""
+    d = 0.0
+    for k in range(from_idx, to_idx):
+        d += dist_2d(pts[k], pts[k + 1])
+    return d
+
+
 def interpolate_z(idx, pts_with_z):
     """
     Linearly interpolate Z for vertex at idx from surrounding vertices that have Z.
+    Uses distance along the polyline (not straight-line) for accurate interpolation.
     Falls back to nearest known Z on the same polyline.
     """
     n = len(pts_with_z)
 
     # Find previous vertex with Z
-    prev_z, prev_pt, prev_idx = None, None, None
+    prev_z, prev_idx = None, None
     for i in range(idx - 1, -1, -1):
         if pts_with_z[i][2] is not None and pts_with_z[i][2] != 0.0:
             prev_z = pts_with_z[i][2]
-            prev_pt = pts_with_z[i]
             prev_idx = i
             break
 
     # Find next vertex with Z
-    next_z, next_pt, next_idx = None, None, None
+    next_z, next_idx = None, None
     for i in range(idx + 1, n):
         if pts_with_z[i][2] is not None and pts_with_z[i][2] != 0.0:
             next_z = pts_with_z[i][2]
-            next_pt = pts_with_z[i]
             next_idx = i
             break
 
     if prev_z is not None and next_z is not None:
-        # Linear interpolation
-        d_total = dist_2d(prev_pt, next_pt)
+        # Linear interpolation along polyline path
+        d_total = polyline_dist(pts_with_z, prev_idx, next_idx)
         if d_total < 1e-6:
             return prev_z
-        d_part = dist_2d(prev_pt, pts_with_z[idx])
+        d_part = polyline_dist(pts_with_z, prev_idx, idx)
         return prev_z + (d_part / d_total) * (next_z - prev_z)
     elif prev_z is not None:
         return prev_z
@@ -305,33 +312,39 @@ def convert_lines_to_3d(msp, line_geometry, points_3d, search_radius):
     count = 0
 
     for verts_2d, layer, category in line_geometry:
-        # Step 1: Assign nearest Z to each vertex
+        # Step 1: Assign nearest Z to each vertex (None if no nearby point)
         pts_with_z = []
         for vx, vy in verts_2d:
             z = find_nearest_z((vx, vy), points_3d, search_radius)
-            pts_with_z.append((vx, vy, z if z else 0.0))
+            pts_with_z.append((vx, vy, z))
 
-        # Step 2: Interpolate missing Z values
+        # Step 2: Interpolate missing Z values along polyline path
         for i in range(len(pts_with_z)):
-            if pts_with_z[i][2] == 0.0:
+            if pts_with_z[i][2] is None:
                 interp = interpolate_z(i, pts_with_z)
                 if interp is not None:
                     pts_with_z[i] = (pts_with_z[i][0], pts_with_z[i][1], interp)
 
-        # Step 3: Fill any remaining 0.0 with nearest non-zero Z on same feature
+        # Step 3: Fill any remaining None with nearest known-Z vertex on same feature
         for i in range(len(pts_with_z)):
-            if pts_with_z[i][2] == 0.0:
-                best_z = 0.0
+            if pts_with_z[i][2] is None:
+                best_z = None
                 best_d = 1e99
                 for j, (ox, oy, oz) in enumerate(pts_with_z):
-                    if oz != 0.0 and i != j:
+                    if oz is not None and i != j:
                         d = dist_2d(pts_with_z[i], (ox, oy))
                         if d < best_d:
                             best_d = d
                             best_z = oz
-                pts_with_z[i] = (pts_with_z[i][0], pts_with_z[i][1], best_z)
+                if best_z is not None:
+                    pts_with_z[i] = (pts_with_z[i][0], pts_with_z[i][1], best_z)
 
-        # Step 4: Create 3D polyline
+        # Step 4: Finalize — replace any remaining None Z with 0.0
+        pts_with_z = [
+            (x, y, z if z is not None else 0.0) for x, y, z in pts_with_z
+        ]
+
+        # Step 5: Create 3D polyline
         if len(pts_with_z) >= 2:
             msp.add_polyline3d(
                 pts_with_z,
