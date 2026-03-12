@@ -28,6 +28,11 @@ DRIVE_KEYWORDS = ["drive", "path"]
 FENCE_KEYWORDS = ["fence", "wall", "boundary"]
 ROAD_KEYWORDS = ["road", "footpath", "kerb"]
 
+# Additional layer name substrings treated as building outline sources.
+# These layers contain LWPOLYLINE and/or LINE entities that form building
+# footprints but don't match BUILDING_KEYWORDS (e.g. party wall layers).
+BUILDING_OUTLINE_EXTRA_LAYERS = ["EXTERNAL PARTY WALL", "PLOT OUTLINE INNER"]
+
 # Elevation text layer patterns
 SPOT_LEVEL_LAYERS = ["LR SPOT LEVEL", "L018 HA_ANN_FEAT_TEXT"]
 FFL_LAYERS = ["LR LLFA FFL"]
@@ -577,17 +582,92 @@ def convert_lines_to_3d(msp, line_geometry, points_3d, search_radius):
 # Phase 3: Building pads — explode blocks, find outlines, elevate to FFL
 # ---------------------------------------------------------------------------
 
+def _is_outline_layer(layer_name):
+    """Return True if this layer should be treated as a building outline source."""
+    lu = layer_name.upper()
+    if classify_layer(layer_name) == "building":
+        return True
+    for pattern in BUILDING_OUTLINE_EXTRA_LAYERS:
+        if pattern.upper() in lu:
+            return True
+    return False
+
+
+def _chain_lines_to_outlines(lines, snap_tol=0.05):
+    """
+    Deduplicate and chain a list of ((x1,y1),(x2,y2)) LINE pairs into closed
+    polygons. Returns list of vertex lists for chains that close on themselves.
+    """
+    # Deduplicate by normalising each line's direction
+    seen = set()
+    unique = []
+    for a, b in lines:
+        key = (round(min(a[0], b[0]), 3), round(min(a[1], b[1]), 3),
+               round(max(a[0], b[0]), 3), round(max(a[1], b[1]), 3))
+        if key not in seen:
+            seen.add(key)
+            unique.append((a, b))
+
+    if not unique:
+        return []
+
+    def snap(p):
+        f = 1.0 / snap_tol
+        return (round(p[0] * f), round(p[1] * f))
+
+    head_map = defaultdict(list)
+    tail_map = defaultdict(list)
+    segs = {}
+    for i, (a, b) in enumerate(unique):
+        segs[i] = [a, b]
+        head_map[snap(a)].append(i)
+        tail_map[snap(b)].append(i)
+
+    used = set()
+    closed_chains = []
+
+    for start in sorted(segs):
+        if start in used:
+            continue
+        used.add(start)
+        chain = list(segs[start])
+
+        for _ in range(500):
+            tk = snap(chain[-1])
+            found = False
+            for ni in head_map.get(tk, []):
+                if ni not in used:
+                    used.add(ni)
+                    chain.extend(segs[ni][1:])
+                    found = True
+                    break
+            if not found:
+                for ni in tail_map.get(tk, []):
+                    if ni not in used:
+                        used.add(ni)
+                        chain.extend(list(reversed(segs[ni]))[1:])
+                        found = True
+                        break
+            if not found:
+                break
+
+        # Only keep chains that close on themselves
+        if len(chain) >= 4 and dist_2d(chain[0], chain[-1]) <= snap_tol:
+            closed_chains.append(chain)
+
+    return closed_chains
+
+
 def collect_building_outlines(msp, doc):
     """
-    Collect building outline polylines, including those deeply nested inside blocks.
-    H-PLOT OUTLINE INNER polylines can be 2+ levels deep inside house/garage blocks.
+    Collect building outline polygons, including those deeply nested inside
+    blocks and those formed by LINE entities on party-wall/outline layers.
     Returns list of (vertices, layer_name).
     """
     outlines = []
-    seen = set()  # Deduplicate by centroid (handles duplicate INSERT references)
+    seen = set()  # Deduplicate by centroid
 
     def add_outline(verts, layer):
-        # Use centroid as a simple deduplication key
         if len(verts) < 3:
             return
         cx = round(sum(v[0] for v in verts) / len(verts), 3)
@@ -597,12 +677,8 @@ def collect_building_outlines(msp, doc):
             seen.add(key)
             outlines.append((verts, layer))
 
-    # Direct polylines on building layers
-    for entity in msp:
-        if entity.dxftype() == "LWPOLYLINE":
-            if classify_layer(entity.dxf.layer) == "building":
-                verts = [(x, y) for x, y, *_ in entity.get_points()]
-                add_outline(verts, entity.dxf.layer)
+    # Collect LINE entities from outline layers inside blocks, grouped by layer
+    lines_by_layer = defaultdict(list)
 
     # Recursively explode INSERT entities on building layers
     for entity in msp:
@@ -612,15 +688,37 @@ def collect_building_outlines(msp, doc):
             continue
 
         for sub in iter_virtual_deep(entity):
-            if sub.dxftype() != "LWPOLYLINE":
-                continue
             sl = sub.dxf.layer
-            # Accept H-PLOT OUTLINE INNER or any building-classified layer
-            if "PLOT OUTLINE INNER" in sl.upper() or classify_layer(sl) == "building":
+            if not _is_outline_layer(sl):
+                continue
+
+            if sub.dxftype() == "LWPOLYLINE":
                 verts = [(x, y) for x, y, *_ in sub.get_points()]
                 add_outline(verts, sl)
 
-    print(f"  Found {len(outlines)} building outlines (including from exploded blocks)")
+            elif sub.dxftype() == "LINE":
+                s = sub.dxf.start
+                e = sub.dxf.end
+                length = math.sqrt((e.x - s.x) ** 2 + (e.y - s.y) ** 2)
+                if length > 0.01:
+                    lines_by_layer[sl].append(((s.x, s.y), (e.x, e.y)))
+
+    # Chain LINE entities into closed polygons, per layer
+    line_outlines = 0
+    for layer, lines in lines_by_layer.items():
+        for chain in _chain_lines_to_outlines(lines):
+            add_outline(chain, layer)
+            line_outlines += 1
+
+    # Direct polylines on building layers in modelspace
+    for entity in msp:
+        if entity.dxftype() == "LWPOLYLINE":
+            if classify_layer(entity.dxf.layer) == "building":
+                verts = [(x, y) for x, y, *_ in entity.get_points()]
+                add_outline(verts, entity.dxf.layer)
+
+    print(f"  Found {len(outlines)} building outlines "
+          f"({line_outlines} from chained LINE entities)")
     return outlines
 
 
