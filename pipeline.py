@@ -475,6 +475,40 @@ def create_building_pads(msp, doc, elevation_data):
 # Setup output layers
 # ---------------------------------------------------------------------------
 
+def cleanup_xref_linetypes(doc):
+    """
+    Fix or remove xref-dependent linetypes (names containing '|') that aren't
+    properly flagged. Civil 3D rejects these with 'LTYPE Table' errors.
+    """
+    linetypes_to_remove = []
+    for lt in doc.linetypes:
+        if '|' in lt.dxf.name:
+            linetypes_to_remove.append(lt.dxf.name)
+
+    if not linetypes_to_remove:
+        return
+
+    # Reassign any layers using these linetypes to "Continuous"
+    for layer in doc.layers:
+        lt_name = layer.dxf.get('linetype', '')
+        if lt_name in linetypes_to_remove:
+            layer.dxf.linetype = "Continuous"
+
+    # Remove the problematic linetypes
+    for name in linetypes_to_remove:
+        try:
+            doc.linetypes.remove(name)
+        except Exception:
+            # If removal fails, fix the flags instead (set xref-dependent flag 16)
+            try:
+                lt = doc.linetypes.get(name)
+                lt.dxf.flags = lt.dxf.flags | 16
+            except Exception:
+                pass
+
+    print(f"  Cleaned up {len(linetypes_to_remove)} xref-dependent linetypes")
+
+
 def setup_output_layers(doc):
     """Create the output layers with appropriate colors."""
     layers = doc.layers
@@ -512,13 +546,18 @@ def run_pipeline(input_path, output_path, search_radius=5.0):
     layer_count = len(doc.layers)
     print(f"  Loaded: {entity_count} entities, {layer_count} layers\n")
 
+    # Cleanup xref-dependent linetypes (Civil 3D rejects these)
+    print("[2/7] Cleaning up xref-dependent linetypes...")
+    cleanup_xref_linetypes(doc)
+    print()
+
     # Setup output layers
-    print("[2/6] Setting up output layers...")
+    print("[3/7] Setting up output layers...")
     setup_output_layers(doc)
     print()
 
     # Phase 1: Extract elevation text and create 3D points
-    print("[3/6] Extracting elevation text and creating 3D points...")
+    print("[4/7] Extracting elevation text and creating 3D points...")
     elevation_data = collect_elevation_text(msp, doc)
     print(f"  Found {len(elevation_data)} elevation text entities")
 
@@ -535,16 +574,16 @@ def run_pipeline(input_path, output_path, search_radius=5.0):
     print()
 
     # Phase 2: Collect line geometry and convert to 3D
-    print("[4/6] Collecting line geometry...")
+    print("[5/7] Collecting line geometry...")
     line_geometry = collect_line_geometry(msp, ["drive", "fence", "road"])
     print()
 
-    print("[5/6] Converting lines to 3D polylines...")
+    print("[6/7] Converting lines to 3D polylines...")
     convert_lines_to_3d(msp, line_geometry, points_3d, search_radius)
     print()
 
     # Phase 3: Building pads
-    print("[6/6] Creating building pads...")
+    print("[7/7] Creating building pads...")
     create_building_pads(msp, doc, elevation_data)
     print()
 
