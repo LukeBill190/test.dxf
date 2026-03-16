@@ -562,16 +562,27 @@ def assign_z_spot_owned(verts_2d, terrain_pts, search_radius=TERRAIN_SEARCH_RAD)
     """
     Elevation model for open polylines (drives, fences, roads).
 
-    Each terrain point 'owns' the single nearest vertex within search_radius.
-    Ownership is assigned greedily (shortest terrain→vertex distance first), so
-    each vertex receives the Z of its closest terrain point and each terrain point
-    influences exactly one vertex — matching the survey convention where a spot
-    level controls only the one polyline node closest to it.
+    Phase 1 – Spot-owned assignment (search_radius = TERRAIN_SEARCH_RAD = 5 m):
+      Each terrain point claims the single nearest vertex within search_radius.
+      Greedy assignment (shortest distance first) so each vertex receives the Z
+      of its closest terrain point and each terrain point influences exactly one
+      vertex — matching the survey convention that a spot level controls only
+      the one polyline node closest to it.
 
-    Intermediate vertices between owned vertices receive Z by linear interpolation
-    along cumulative polyline length.  End vertices with no outward owned neighbour
-    fall back to the nearest known Z in the polyline; any still-unknown vertex
-    defaults to 0.0.
+    Phase 2 – Linear interpolation along polyline:
+      Vertices between two owned vertices receive Z by linear interpolation of
+      cumulative path length, as specified for intermediate vertices between
+      surveyed spot levels.
+
+    Phase 3 – Wide nearest-terrain fallback (search_radius):
+      Vertices not claimed by any terrain point in Phase 1 (i.e. no terrain
+      point chose them as its nearest vertex) receive Z from the nearest terrain
+      point within search_radius.  This covers polyline endpoints and vertices
+      in gaps between spot levels that interpolation cannot reach (no known Z
+      on one side).
+
+    Phase 4 – Nearest-Z-in-polyline:
+      Last resort for polylines entirely outside terrain coverage.
     """
     n = len(verts_2d)
     if n == 0:
@@ -579,7 +590,9 @@ def assign_z_spot_owned(verts_2d, terrain_pts, search_radius=TERRAIN_SEARCH_RAD)
 
     z_assigned = [None] * n
 
-    # Build (dist, terrain_z, vertex_index) — each terrain point → its nearest vertex
+    # ── Phase 1: spot-owned greedy assignment ─────────────────────────────────
+    # Each terrain point finds its nearest vertex; sorted so closest pairs are
+    # processed first and each vertex is claimed at most once.
     candidates = []
     for tx, ty, tz in terrain_pts:
         best_i, best_d = None, search_radius
@@ -591,7 +604,6 @@ def assign_z_spot_owned(verts_2d, terrain_pts, search_radius=TERRAIN_SEARCH_RAD)
         if best_i is not None:
             candidates.append((best_d, tz, best_i))
 
-    # Greedy assignment: shortest distance first; each vertex claimed at most once
     candidates.sort()
     for _d, tz, i in candidates:
         if z_assigned[i] is None:
@@ -599,14 +611,21 @@ def assign_z_spot_owned(verts_2d, terrain_pts, search_radius=TERRAIN_SEARCH_RAD)
 
     pts = [(verts_2d[i][0], verts_2d[i][1], z_assigned[i]) for i in range(n)]
 
-    # Linear interpolation along polyline for unassigned interior vertices
+    # ── Phase 2: linear interpolation along polyline ──────────────────────────
     for i in range(n):
         if pts[i][2] is None:
             z = interpolate_z_along(pts, i)
             if z is not None:
                 pts[i] = (pts[i][0], pts[i][1], z)
 
-    # Nearest-Z fallback for remaining gaps (typically end vertices beyond terrain coverage)
+    # ── Phase 3: nearest-terrain fallback for unclaimed vertices ─────────────
+    for i in range(n):
+        if pts[i][2] is None:
+            z = find_nearest_z(pts[i][0], pts[i][1], terrain_pts, search_radius)
+            if z is not None:
+                pts[i] = (pts[i][0], pts[i][1], z)
+
+    # ── Phase 4: nearest-Z-in-polyline for full-gap polylines ────────────────
     for i in range(n):
         if pts[i][2] is None:
             best_z, best_d = None, 1e99
@@ -1129,6 +1148,7 @@ def run_pipeline(input_path, output_path):
     if terrain_pts:
         zs = [z for _, _, z in terrain_pts]
         print(f"  Elevation range: {min(zs):.3f} – {max(zs):.3f} m")
+
     print()
 
     # ── Line geometry ─────────────────────────────────────────────────────────
