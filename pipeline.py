@@ -1,139 +1,175 @@
 #!/usr/bin/env python3
 """
-External Works DXF → 3D Model Pipeline
+External Works DXF → 3D Model Pipeline (v2)
 
 Reads a 2D external works DXF file and produces a 3D DXF with:
-- 3D_Points: POINT entities at spot level locations with Z from text values
-- 3D_Lines: 3D polylines for drives, fences, walls, roads with Z from nearby points
-- 3D_Building_Pads: Building outlines elevated to FFL
+  PLOTS FFL            - Building pad boundaries inset 25 mm, all vertices at FFL Z
+  PLOTS EXTERNAL LEVEL - Building pad external outlines with per-vertex ground Z
+  3D_LINES             - All other line/arc/polyline geometry elevated from terrain
+  3D_Points            - Spot level POINT entities (reference layer)
 
-Ported from AutoCAD LISP routines: c:go, c:ApplyElevations, c:Lines23D
+Key behaviours
+  - Adjacent plots that share a single FFL annotation are merged into one polygon
+  - The FFL boundary is the merged polygon inset by FFL_OFFSET (25 mm)
+  - The external-level boundary is the merged polygon with Z interpolated from spot levels
+  - Every LINE / ARC / LWPOLYLINE / POLYLINE that is not a building outline is
+    elevated from the terrain model and written to 3D_LINES
+  - Output is written to a fresh DXF with only the 4 output layers defined
 """
 
 import sys
 import re
 import math
 import ezdxf
-from ezdxf.math import Vec3
-from collections import defaultdict
+from collections import defaultdict, deque
+from shapely.geometry import Polygon, Point, MultiPolygon
+from shapely.ops import unary_union
 
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-# Layer keyword classification (case-insensitive substring matching)
-BUILDING_KEYWORDS = ["plot", "building", "house", "garage"]
-DRIVE_KEYWORDS = ["drive", "path"]
-FENCE_KEYWORDS = ["fence", "wall", "boundary"]
-ROAD_KEYWORDS = ["road", "footpath", "kerb"]
+# Layer patterns that identify building plot outlines (case-insensitive substring)
+# NOTE: party-wall layers are excluded here — they are used only to suppress those
+# entities from 3D_LINES, not as a source of plot outline geometry.
+BUILDING_OUTLINE_LAYERS = ["PLOT OUTLINE INNER"]   # source for pad geometry only
+BUILDING_KEYWORDS       = ["plot", "building", "house", "garage"]
+BUILDING_SUPPRESS_LAYERS = ["EXTERNAL PARTY WALL"]  # exclude from 3D_LINES but not pads
 
-# Additional layer name substrings treated as building outline sources.
-# These layers contain LWPOLYLINE and/or LINE entities that form building
-# footprints but don't match BUILDING_KEYWORDS (e.g. party wall layers).
-BUILDING_OUTLINE_EXTRA_LAYERS = ["EXTERNAL PARTY WALL", "PLOT OUTLINE INNER"]
+# Layer keyword classification for 3D_LINES geometry selection
+DRIVE_KEYWORDS  = ["drive", "path"]
+FENCE_KEYWORDS  = ["fence", "wall", "boundary"]
+ROAD_KEYWORDS   = ["road", "footpath", "kerb"]
 
-# Elevation text layer patterns
+# Elevation text source layers
 SPOT_LEVEL_LAYERS = ["LR SPOT LEVEL", "L018 HA_ANN_FEAT_TEXT"]
-FFL_LAYERS = ["LR LLFA FFL"]
-DPC_LAYERS = ["LR DPC LEVEL"]
+FFL_LAYERS        = ["LR LLFA FFL"]
+DPC_LAYERS        = ["LR DPC LEVEL"]
 
-# Regex patterns for elevation text parsing
-# Matches: 53.70, +53.70, 53.70+, FFL 53.80, FFL\P53.80, DPC 54.20
-ELEVATION_PATTERN = re.compile(
-    r"[+]?\s*(\d{2,3}\.\d{1,4})\s*[+]?"
-)
-FFL_PATTERN = re.compile(
-    r"FFL[\s\\P]*(\d{2,3}\.\d{1,4})", re.IGNORECASE
-)
+# Regex patterns for elevation text
+ELEVATION_PATTERN = re.compile(r"[+]?\s*(\d{2,3}\.\d{1,4})\s*[+]?")
+FFL_PATTERN       = re.compile(r"FFL[\s\\P]*(\d{2,3}\.\d{1,4})", re.IGNORECASE)
 
-# Output layer names and colors
-LAYER_3D_POINTS = "3D_Points"
-LAYER_3D_LINES = "3D_Lines"
-LAYER_3D_BUILDING_PADS = "3D_Building_Pads"
+# Output layer names (must match reference exactly)
+LAYER_PLOTS_FFL      = "PLOTS FFL"
+LAYER_PLOTS_EXTERNAL = "PLOTS EXTERNAL LEVEL"
+LAYER_3D_LINES       = "3D_LINES"
+LAYER_3D_POINTS      = "3D_Points"
 
-COLOR_POINTS = 1      # Red
-COLOR_LINES = 3        # Green
-COLOR_PADS = 5         # Blue
+# Building pad FFL inset (metres)
+FFL_OFFSET = 0.025   # 25 mm
 
-# Arc tessellation: max chord length in metres (smaller = smoother)
+# Tolerances
+CHAIN_SNAP_TOL      = 0.05   # 50 mm: endpoint match when chaining segments
+VERTEX_INSERT_RADIUS = 0.3   # 300 mm: snap radius for spot-level vertex insertion
+ADJACENCY_TOL       = 0.35   # 350 mm: plots within this distance are adjacent (crosses party walls)
+TERRAIN_SEARCH_RAD  = 5.0    # 5 m: radius for terrain Z lookup
+
+# Building pad merge parameters
+WALL_BUFFER     = 0.205  # 205 mm: wall thickness buffer; expands inner→outer boundary
+SIMPLIFY_TOL    = 0.20   # 200 mm: polygon simplification after merge (for clean vertex counts)
+
+# Arc tessellation: max chord length (metres)
 ARC_CHORD_MAX = 0.1
 
-# Snap tolerances
-CHAIN_SNAP_TOL = 0.05       # 50mm: endpoint matching when chaining segments
-VERTEX_INSERT_RADIUS = 0.3  # 300mm: insert vertex if no vertex within this radius of a spot level
-
 
 # ---------------------------------------------------------------------------
-# Utility functions
+# Utility helpers
 # ---------------------------------------------------------------------------
 
-def dist_2d(p1, p2):
-    """2D distance between two points (ignores Z)."""
-    return math.sqrt((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2)
+def dist_2d(a, b):
+    """2-D Euclidean distance (ignores Z)."""
+    return math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2)
+
+
+def _is_pad_source_layer(layer_name):
+    """True if this layer is the source of building plot outline geometry (H-PLOT OUTLINE INNER etc.)."""
+    lu = layer_name.upper()
+    for pat in BUILDING_OUTLINE_LAYERS:
+        if pat.upper() in lu:
+            return True
+    return False
+
+
+def _is_suppress_from_lines(layer_name):
+    """True if this layer should be excluded from 3D_LINES output."""
+    lu = layer_name.upper()
+    for kw in BUILDING_KEYWORDS:
+        if kw.upper() in lu:
+            return True
+    for pat in BUILDING_OUTLINE_LAYERS + BUILDING_SUPPRESS_LAYERS:
+        if pat.upper() in lu:
+            return True
+    return False
 
 
 def classify_layer(layer_name):
-    """Classify a layer by keyword matching. Returns category or None."""
-    ln = layer_name.upper()
-    for kw in BUILDING_KEYWORDS:
-        if kw.upper() in ln:
-            return "building"
+    """Classify a layer as drive / fence / road, or return None."""
+    lu = layer_name.upper()
     for kw in DRIVE_KEYWORDS:
-        if kw.upper() in ln:
+        if kw.upper() in lu:
             return "drive"
     for kw in FENCE_KEYWORDS:
-        if kw.upper() in ln:
+        if kw.upper() in lu:
             return "fence"
     for kw in ROAD_KEYWORDS:
-        if kw.upper() in ln:
+        if kw.upper() in lu:
             return "road"
     return None
 
 
 def parse_elevation(text_value, is_ffl=False):
-    """Extract a numeric elevation from text. Returns float or None."""
+    """Extract a numeric elevation from a text string. Returns float or None."""
     if not text_value:
         return None
     text_value = text_value.strip()
-
     if is_ffl:
         m = FFL_PATTERN.search(text_value)
         if m:
             return float(m.group(1))
-
     m = ELEVATION_PATTERN.search(text_value)
     if m:
         val = float(m.group(1))
-        # Sanity check: typical UK site levels are 0-500m AOD
-        if 0 < val < 500:
+        if 0 < val < 500:   # sanity: UK AOD levels
             return val
     return None
 
 
 def get_text_value(entity):
-    """Get the text string from a TEXT or MTEXT entity."""
     if entity.dxftype() == "TEXT":
         return entity.dxf.text
-    elif entity.dxftype() == "MTEXT":
+    if entity.dxftype() == "MTEXT":
         return entity.plain_text()
     return None
 
 
 def get_text_insertion(entity):
-    """Get the insertion point of a TEXT or MTEXT entity."""
-    if entity.dxftype() == "TEXT":
-        return Vec3(entity.dxf.insert)
-    elif entity.dxftype() == "MTEXT":
-        return Vec3(entity.dxf.insert)
+    if entity.dxftype() in ("TEXT", "MTEXT"):
+        pt = entity.dxf.insert
+        return (pt.x, pt.y)
     return None
 
 
+def tessellate_arc(entity):
+    """Convert an ARC entity into a list of (x, y) points."""
+    cx, cy = entity.dxf.center.x, entity.dxf.center.y
+    r = entity.dxf.radius
+    sa = math.radians(entity.dxf.start_angle)
+    ea = math.radians(entity.dxf.end_angle)
+    if ea <= sa:
+        ea += 2 * math.pi
+    arc_len = r * (ea - sa)
+    n = max(4, int(math.ceil(arc_len / ARC_CHORD_MAX)))
+    return [
+        (cx + r * math.cos(sa + (ea - sa) * i / n),
+         cy + r * math.sin(sa + (ea - sa) * i / n))
+        for i in range(n + 1)
+    ]
+
+
 def iter_virtual_deep(insert_entity, max_depth=6):
-    """
-    Recursively yield all virtual entities within an INSERT block,
-    traversing nested INSERT references up to max_depth levels.
-    """
+    """Yield all virtual entities from a nested INSERT, recursively."""
     if max_depth <= 0:
         return
     try:
@@ -146,217 +182,295 @@ def iter_virtual_deep(insert_entity, max_depth=6):
 
 
 # ---------------------------------------------------------------------------
-# Phase 1: Parse elevation text and create 3D points
+# Phase 1 – Collect elevation text and build terrain point cloud
 # ---------------------------------------------------------------------------
 
-def collect_elevation_text(msp, doc):
+def collect_elevation_text(msp):
     """
-    Collect all elevation text from the drawing, including text inside blocks.
-    Returns list of (insertion_point_xy, elevation_value, layer_name, is_ffl).
+    Scan modelspace (and INSERT blocks) for TEXT / MTEXT on elevation layers.
+    Returns list of ((x, y), elevation, layer, is_ffl).
     """
     results = []
 
-    # Direct text entities in modelspace
-    for entity in msp:
-        if entity.dxftype() not in ("TEXT", "MTEXT"):
-            continue
+    def process_text(entity):
         layer = entity.dxf.layer.upper()
         text_val = get_text_value(entity)
         insert_pt = get_text_insertion(entity)
         if text_val is None or insert_pt is None:
-            continue
-
-        is_ffl = any(fl.upper() in layer for fl in FFL_LAYERS)
+            return
+        is_ffl  = any(fl.upper() in layer for fl in FFL_LAYERS)
         is_spot = any(sl.upper() in layer for sl in SPOT_LEVEL_LAYERS)
-        is_dpc = any(dl.upper() in layer for dl in DPC_LAYERS)
-
+        is_dpc  = any(dl.upper() in layer for dl in DPC_LAYERS)
         if is_ffl or is_spot or is_dpc:
             elev = parse_elevation(text_val, is_ffl=is_ffl)
             if elev is not None:
-                results.append((
-                    (insert_pt.x, insert_pt.y),
-                    elev,
-                    entity.dxf.layer,
-                    is_ffl
-                ))
+                results.append((insert_pt, elev, entity.dxf.layer, is_ffl))
 
-    # Also check INSERT entities (blocks) for text — recurse through nested blocks
     for entity in msp:
-        if entity.dxftype() != "INSERT":
-            continue
-        try:
+        if entity.dxftype() in ("TEXT", "MTEXT"):
+            process_text(entity)
+        elif entity.dxftype() == "INSERT":
             for sub in iter_virtual_deep(entity):
-                if sub.dxftype() not in ("TEXT", "MTEXT"):
-                    continue
-                layer = sub.dxf.layer.upper()
-                text_val = get_text_value(sub)
-                insert_pt = get_text_insertion(sub)
-                if text_val is None or insert_pt is None:
-                    continue
-
-                is_ffl = any(fl.upper() in layer for fl in FFL_LAYERS)
-                is_spot = any(sl.upper() in layer for sl in SPOT_LEVEL_LAYERS)
-                is_dpc = any(dl.upper() in layer for dl in DPC_LAYERS)
-
-                if is_ffl or is_spot or is_dpc:
-                    elev = parse_elevation(text_val, is_ffl=is_ffl)
-                    if elev is not None:
-                        results.append((
-                            (insert_pt.x, insert_pt.y),
-                            elev,
-                            sub.dxf.layer,
-                            is_ffl
-                        ))
-        except Exception:
-            continue
+                if sub.dxftype() in ("TEXT", "MTEXT"):
+                    process_text(sub)
 
     return results
 
 
-def create_3d_points(msp, elevation_data):
+def build_terrain_points(elevation_data):
     """
-    Create POINT entities at elevation text locations with Z = elevation value.
-    This bridges the gap for LISP routines that expect POINT entities.
-    Returns list of (x, y, z) for all created points.
+    Convert elevation data into a flat list of (x, y, z) terrain points.
+    FFL annotations are included (they are valid ground elevations too).
     """
-    points_3d = []
-    for (x, y), elev, layer, is_ffl in elevation_data:
-        msp.add_point(
-            (x, y, elev),
-            dxfattribs={"layer": LAYER_3D_POINTS}
-        )
-        points_3d.append((x, y, elev))
-
-    print(f"  Created {len(points_3d)} 3D points on '{LAYER_3D_POINTS}'")
-    return points_3d
+    return [(xy[0], xy[1], elev) for xy, elev, _layer, _is_ffl in elevation_data]
 
 
 # ---------------------------------------------------------------------------
-# Phase 2: Collect geometry and convert to 3D polylines
+# Phase 2 – Terrain Z lookup and interpolation helpers
 # ---------------------------------------------------------------------------
 
-def tessellate_arc(entity):
+def find_nearest_z(px, py, points_3d, radius):
+    """Return the Z of the nearest terrain point within radius, or None."""
+    best_z, best_d = None, radius
+    for x, y, z in points_3d:
+        d = math.sqrt((px - x) ** 2 + (py - y) ** 2)
+        if d < best_d:
+            best_d = d
+            best_z = z
+    return best_z
+
+
+def _polyline_dist(pts, from_idx, to_idx):
+    d = 0.0
+    for k in range(from_idx, to_idx):
+        d += dist_2d(pts[k], pts[k + 1])
+    return d
+
+
+def interpolate_z_along(pts_with_z, idx):
     """
-    Convert an ARC entity into a list of 2D points.
-    Uses ARC_CHORD_MAX to control segment density.
+    Linearly interpolate Z for vertex idx from the nearest known-Z neighbours
+    along the polyline. Falls back to nearest known Z.
     """
-    cx = entity.dxf.center.x
-    cy = entity.dxf.center.y
-    r = entity.dxf.radius
-    sa = math.radians(entity.dxf.start_angle)
-    ea = math.radians(entity.dxf.end_angle)
+    n = len(pts_with_z)
+    prev_z = prev_i = None
+    for i in range(idx - 1, -1, -1):
+        if pts_with_z[i][2] is not None:
+            prev_z, prev_i = pts_with_z[i][2], i
+            break
+    next_z = next_i = None
+    for i in range(idx + 1, n):
+        if pts_with_z[i][2] is not None:
+            next_z, next_i = pts_with_z[i][2], i
+            break
+    if prev_z is not None and next_z is not None:
+        d_total = _polyline_dist(pts_with_z, prev_i, next_i)
+        if d_total < 1e-6:
+            return prev_z
+        d_part = _polyline_dist(pts_with_z, prev_i, idx)
+        return prev_z + (d_part / d_total) * (next_z - prev_z)
+    return prev_z if prev_z is not None else next_z
 
-    # Handle wrap-around (arc crosses 0°)
-    if ea <= sa:
-        ea += 2 * math.pi
 
-    arc_len = r * (ea - sa)
-    n_segs = max(4, int(math.ceil(arc_len / ARC_CHORD_MAX)))
+def assign_z_to_vertices(verts_2d, points_3d, search_radius=TERRAIN_SEARCH_RAD):
+    """
+    Assign Z to each 2-D vertex from the terrain point cloud.
+    Gaps are filled by polyline interpolation, then nearest neighbour.
+    Remaining unknowns fall back to 0.0.
+    Returns list of (x, y, z).
+    """
+    # Pass 1: direct nearest-point lookup
+    pts = [(x, y, find_nearest_z(x, y, points_3d, search_radius))
+           for x, y in verts_2d]
 
-    pts = []
-    for i in range(n_segs + 1):
-        t = sa + (ea - sa) * i / n_segs
-        pts.append((cx + r * math.cos(t), cy + r * math.sin(t)))
+    # Pass 2: interpolate along polyline for missing
+    for i in range(len(pts)):
+        if pts[i][2] is None:
+            z = interpolate_z_along(pts, i)
+            if z is not None:
+                pts[i] = (pts[i][0], pts[i][1], z)
+
+    # Pass 3: nearest-neighbour on same feature for remaining gaps
+    for i in range(len(pts)):
+        if pts[i][2] is None:
+            best_z, best_d = None, 1e99
+            for j, (ox, oy, oz) in enumerate(pts):
+                if oz is not None and i != j:
+                    d = dist_2d(pts[i], (ox, oy))
+                    if d < best_d:
+                        best_d, best_z = d, oz
+            if best_z is not None:
+                pts[i] = (pts[i][0], pts[i][1], best_z)
+
+    # Pass 4: fallback 0.0
+    return [(x, y, z if z is not None else 0.0) for x, y, z in pts]
+
+
+def assign_z_to_ring(ring_2d, points_3d, search_radius=TERRAIN_SEARCH_RAD):
+    """
+    Like assign_z_to_vertices but treats the input as a closed ring —
+    wraps around for interpolation so the last vertex can borrow from
+    the first and vice-versa.
+    """
+    # Duplicate ring for wrap-around interpolation
+    ring = list(ring_2d)
+    closed = (len(ring) >= 2 and dist_2d(ring[0], ring[-1]) < 1e-6)
+    if closed:
+        ring = ring[:-1]   # strip repeated closing vertex
+
+    # Direct lookup
+    pts = [(x, y, find_nearest_z(x, y, points_3d, search_radius))
+           for x, y in ring]
+
+    n = len(pts)
+    if n == 0:
+        return []
+
+    # Interpolate on the extended ring (pad with wrap-around)
+    extended = pts[-n:] + pts + pts[:n]   # [wrap_back | actual | wrap_fwd]
+    offset = n
+
+    for i in range(n):
+        if pts[i][2] is not None:
+            continue
+        ei = i + offset
+        # Search prev in extended
+        prev_z = prev_ei = None
+        for k in range(ei - 1, ei - n, -1):
+            if extended[k][2] is not None:
+                prev_z, prev_ei = extended[k][2], k
+                break
+        next_z = next_ei = None
+        for k in range(ei + 1, ei + n):
+            if extended[k][2] is not None:
+                next_z, next_ei = extended[k][2], k
+                break
+        if prev_z is not None and next_z is not None:
+            d_total = _polyline_dist(extended, prev_ei, next_ei)
+            if d_total > 1e-6:
+                d_part = _polyline_dist(extended, prev_ei, ei)
+                pts[i] = (pts[i][0], pts[i][1],
+                          prev_z + (d_part / d_total) * (next_z - prev_z))
+            else:
+                pts[i] = (pts[i][0], pts[i][1], prev_z)
+        elif prev_z is not None:
+            pts[i] = (pts[i][0], pts[i][1], prev_z)
+        elif next_z is not None:
+            pts[i] = (pts[i][0], pts[i][1], next_z)
+
+    # Final fallback: mean of known Z values
+    known_z = [z for _, _, z in pts if z is not None]
+    fallback = sum(known_z) / len(known_z) if known_z else 0.0
+    pts = [(x, y, z if z is not None else fallback) for x, y, z in pts]
+
+    # Restore closed vertex
+    if closed:
+        pts.append(pts[0])
     return pts
 
 
-def collect_line_geometry(msp, target_categories=None):
-    """
-    Collect LINE, LWPOLYLINE, POLYLINE and ARC entities on classified layers.
-    ARCs are tessellated into polyline segments.
-    Returns list of (vertices_list, layer_name, category).
-    Each vertices_list is [(x, y), (x, y), ...].
-    """
-    if target_categories is None:
-        target_categories = ["drive", "fence", "road"]
+# ---------------------------------------------------------------------------
+# Phase 3 – Collect all line geometry (everything that is not a building outline)
+# ---------------------------------------------------------------------------
 
+def _extract_verts(entity):
+    """
+    Return the 2-D vertex list for a single LINE / LWPOLYLINE / ARC / POLYLINE
+    entity. Returns [] if entity type is not handled or has < 2 vertices.
+    """
+    t = entity.dxftype()
+    if t == "LINE":
+        s, e = entity.dxf.start, entity.dxf.end
+        return [(s.x, s.y), (e.x, e.y)]
+    if t == "LWPOLYLINE":
+        return [(x, y) for x, y, *_ in entity.get_points()]
+    if t == "POLYLINE":
+        verts = []
+        for v in entity.vertices:
+            p = v.dxf.location
+            verts.append((p.x, p.y))
+        return verts
+    if t == "ARC":
+        return tessellate_arc(entity)
+    return []
+
+
+def collect_line_geometry(msp):
+    """
+    Collect LINE / LWPOLYLINE / ARC / POLYLINE entities on drive, fence and road
+    layers (matching DRIVE_KEYWORDS, FENCE_KEYWORDS, ROAD_KEYWORDS).
+    Building / party-wall layers are excluded.
+
+    Returns list of (vertices_2d, layer_name).
+    """
     results = []
 
-    for entity in msp:
+    def add(entity):
         layer = entity.dxf.layer
-        category = classify_layer(layer)
-        if category not in target_categories:
-            continue
-
-        verts = []
-        if entity.dxftype() == "LINE":
-            start = entity.dxf.start
-            end = entity.dxf.end
-            verts = [(start.x, start.y), (end.x, end.y)]
-        elif entity.dxftype() == "LWPOLYLINE":
-            for x, y, *_ in entity.get_points():
-                verts.append((x, y))
-        elif entity.dxftype() == "POLYLINE":
-            for v in entity.vertices:
-                pt = v.dxf.location
-                verts.append((pt.x, pt.y))
-        elif entity.dxftype() == "ARC":
-            verts = tessellate_arc(entity)
-
+        if _is_suppress_from_lines(layer):
+            return
+        if classify_layer(layer) is None:
+            return
+        verts = _extract_verts(entity)
         if len(verts) >= 2:
-            results.append((verts, layer, category))
+            results.append((verts, layer))
 
-    print(f"  Collected {len(results)} line/arc segments for 3D conversion")
+    for entity in msp:
+        if entity.dxftype() == "INSERT":
+            for sub in iter_virtual_deep(entity):
+                add(sub)
+        else:
+            add(entity)
+
     return results
 
 
-def insert_spot_vertices(segments, elevation_data, search_radius=5.0):
-    """
-    For each spot elevation text with no nearby vertex within VERTEX_INSERT_RADIUS,
-    find the nearest point on any segment within search_radius and split the segment
-    there to create a new vertex. This ensures intermediate spot levels along a line
-    are honoured when elevations are assigned.
+# ---------------------------------------------------------------------------
+# Phase 4 – Insert intermediate spot-level vertices, chain, elevate → 3D_LINES
+# ---------------------------------------------------------------------------
 
-    Returns updated segments list.
+def insert_spot_vertices(segments, terrain_pts, search_radius=5.0):
     """
-    if not segments or not elevation_data:
+    For each terrain point that has no existing vertex within
+    VERTEX_INSERT_RADIUS on any segment, split the nearest segment there.
+    Returns updated segment list with the same (verts, layer) structure.
+    """
+    if not segments or not terrain_pts:
         return segments
 
-    # Work with mutable lists
-    pts_list = [list(pts) for pts, _, _ in segments]
-    meta = [(layer, cat) for _, layer, cat in segments]
-    added = 0
+    pts_list = [list(v) for v, _ in segments]
+    layers   = [l for _, l in segments]
+    added    = 0
 
-    for (tx, ty), _elev, _layer, _is_ffl in elevation_data:
-        # Skip if any vertex on any segment is already within VERTEX_INSERT_RADIUS
-        has_nearby = False
-        for pts in pts_list:
-            for vx, vy in pts:
-                if math.sqrt((tx - vx) ** 2 + (ty - vy) ** 2) <= VERTEX_INSERT_RADIUS:
-                    has_nearby = True
-                    break
-            if has_nearby:
-                break
-        if has_nearby:
+    for tx, ty, _tz in terrain_pts:
+        # Skip if a vertex already exists nearby
+        nearby = any(
+            dist_2d((tx, ty), vt) <= VERTEX_INSERT_RADIUS
+            for verts in pts_list for vt in verts
+        )
+        if nearby:
             continue
 
-        # Find nearest point on any segment within search_radius
-        best_dist = search_radius
-        best_seg = None
-        best_edge = None  # index of edge start vertex in that segment
-        best_t = None
+        # Find nearest edge within TERRAIN_SEARCH_RAD
+        best_dist = TERRAIN_SEARCH_RAD
+        best_seg = best_edge = best_t = None
 
-        for seg_idx, pts in enumerate(pts_list):
-            for i in range(len(pts) - 1):
-                ax, ay = pts[i]
-                bx, by = pts[i + 1]
+        for si, pts in enumerate(pts_list):
+            for ei in range(len(pts) - 1):
+                ax, ay = pts[ei]
+                bx, by = pts[ei + 1]
                 dx, dy = bx - ax, by - ay
                 len_sq = dx * dx + dy * dy
                 if len_sq < 1e-12:
                     continue
-                t = ((tx - ax) * dx + (ty - ay) * dy) / len_sq
-                t = max(0.0, min(1.0, t))
-                nx = ax + t * dx
-                ny = ay + t * dy
+                t = max(0.0, min(1.0, ((tx - ax) * dx + (ty - ay) * dy) / len_sq))
+                nx, ny = ax + t * dx, ay + t * dy
                 d = math.sqrt((tx - nx) ** 2 + (ty - ny) ** 2)
                 if d < best_dist:
                     best_dist = d
-                    best_seg = seg_idx
-                    best_edge = i
-                    best_t = t
+                    best_seg, best_edge, best_t = si, ei, t
 
-        # Insert vertex if not exactly at an existing endpoint (t ≠ 0 or 1)
-        if best_seg is not None and best_t is not None and 1e-4 < best_t < 1.0 - 1e-4:
+        if best_seg is not None and 1e-4 < best_t < 1.0 - 1e-4:
             pts = pts_list[best_seg]
             ax, ay = pts[best_edge]
             bx, by = pts[best_edge + 1]
@@ -364,36 +478,32 @@ def insert_spot_vertices(segments, elevation_data, search_radius=5.0):
             pts_list[best_seg] = pts[:best_edge + 1] + [new_pt] + pts[best_edge + 1:]
             added += 1
 
-    print(f"  Inserted {added} intermediate vertices near elevation texts")
-    return [(pts, layer, cat) for pts, (layer, cat) in zip(pts_list, meta)]
+    print(f"  Inserted {added} intermediate vertices")
+    return list(zip(pts_list, layers))
 
 
 def chain_segments(segments, snap_tol=CHAIN_SNAP_TOL):
     """
     Join segments that share endpoints (within snap_tol) into continuous
-    polylines, grouped by (layer, category). This is especially important
-    for driveways where arcs, lines and polylines form a continuous edge.
-
-    Returns same format: list of (point_list, layer_name, category).
+    polylines, grouped by layer.
+    Returns list of (point_list, layer_name).
     """
     if not segments:
         return segments
 
     def snap_key(pt):
-        factor = 1.0 / snap_tol
-        return (round(pt[0] * factor), round(pt[1] * factor))
+        f = 1.0 / snap_tol
+        return (round(pt[0] * f), round(pt[1] * f))
 
-    # Group indices by (layer, category)
     groups = defaultdict(list)
-    for i, (pts, layer, cat) in enumerate(segments):
-        groups[(layer, cat)].append(i)
+    for i, (pts, layer) in enumerate(segments):
+        groups[layer].append(i)
 
     result = []
 
-    for (layer, cat), indices in groups.items():
-        # Build endpoint lookup: snap_key -> list of seg indices (head or tail)
-        head_map = defaultdict(list)  # key -> [seg_idx, ...]  (key is head of that seg)
-        tail_map = defaultdict(list)  # key -> [seg_idx, ...]  (key is tail of that seg)
+    for layer, indices in groups.items():
+        head_map = defaultdict(list)
+        tail_map = defaultdict(list)
         segs = {}
 
         for i in indices:
@@ -407,206 +517,74 @@ def chain_segments(segments, snap_tol=CHAIN_SNAP_TOL):
 
         used = set()
 
-        for start_i in sorted(segs.keys()):
+        for start_i in sorted(segs):
             if start_i in used:
                 continue
             used.add(start_i)
             chain = list(segs[start_i])
 
-            # Extend forward (from chain tail)
-            changed = True
-            while changed:
-                changed = False
+            # Extend forward from chain tail
+            for _ in range(10000):
                 tk = snap_key(chain[-1])
-
-                # Head of another seg matches our tail
+                matched = False
                 for ni in head_map.get(tk, []):
                     if ni not in used:
-                        used.add(ni)
-                        chain.extend(segs[ni][1:])
-                        changed = True
-                        break
-                if changed:
+                        used.add(ni); chain.extend(segs[ni][1:]); matched = True; break
+                if matched:
                     continue
-
-                # Tail of another seg matches our tail (reverse it)
                 for ni in tail_map.get(tk, []):
                     if ni not in used:
-                        used.add(ni)
-                        chain.extend(list(reversed(segs[ni]))[1:])
-                        changed = True
-                        break
+                        used.add(ni); chain.extend(list(reversed(segs[ni]))[1:]); matched = True; break
+                if not matched:
+                    break
 
-            # Extend backward (from chain head)
-            changed = True
-            while changed:
-                changed = False
+            # Extend backward from chain head
+            for _ in range(10000):
                 hk = snap_key(chain[0])
-
-                # Tail of another seg matches our head
+                matched = False
                 for ni in tail_map.get(hk, []):
                     if ni not in used:
-                        used.add(ni)
-                        chain = list(segs[ni]) + chain[1:]
-                        changed = True
-                        break
-                if changed:
+                        used.add(ni); chain = list(segs[ni]) + chain[1:]; matched = True; break
+                if matched:
                     continue
-
-                # Head of another seg matches our head (reverse it)
                 for ni in head_map.get(hk, []):
                     if ni not in used:
-                        used.add(ni)
-                        chain = list(reversed(segs[ni])) + chain[1:]
-                        changed = True
-                        break
+                        used.add(ni); chain = list(reversed(segs[ni])) + chain[1:]; matched = True; break
+                if not matched:
+                    break
 
-            result.append((chain, layer, cat))
+            result.append((chain, layer))
 
     return result
 
 
-def find_nearest_z(pt_2d, points_3d, radius):
-    """Find the nearest 3D point within radius and return its Z. Returns None if not found."""
-    best_z = None
-    best_dist = radius
-    px, py = pt_2d[0], pt_2d[1]
-    for (x, y, z) in points_3d:
-        d = math.sqrt((px - x) ** 2 + (py - y) ** 2)
-        if d <= best_dist:
-            best_z = z
-            best_dist = d
-    return best_z
-
-
-def polyline_dist(pts, from_idx, to_idx):
-    """Sum of segment-by-segment 2D distances along a polyline from from_idx to to_idx."""
-    d = 0.0
-    for k in range(from_idx, to_idx):
-        d += dist_2d(pts[k], pts[k + 1])
-    return d
-
-
-def interpolate_z(idx, pts_with_z):
+def elevate_line_geometry(segments, terrain_pts):
     """
-    Linearly interpolate Z for vertex at idx from surrounding vertices that have Z.
-    Uses distance along the polyline (not straight-line) for accurate interpolation.
-    Falls back to nearest known Z on the same polyline.
+    Assign Z to every vertex in every segment from the terrain model.
+    Returns list of ([(x,y,z), ...], layer_name).
     """
-    n = len(pts_with_z)
-
-    # Find previous vertex with Z
-    prev_z, prev_idx = None, None
-    for i in range(idx - 1, -1, -1):
-        if pts_with_z[i][2] is not None and pts_with_z[i][2] != 0.0:
-            prev_z = pts_with_z[i][2]
-            prev_idx = i
-            break
-
-    # Find next vertex with Z
-    next_z, next_idx = None, None
-    for i in range(idx + 1, n):
-        if pts_with_z[i][2] is not None and pts_with_z[i][2] != 0.0:
-            next_z = pts_with_z[i][2]
-            next_idx = i
-            break
-
-    if prev_z is not None and next_z is not None:
-        # Linear interpolation along polyline path
-        d_total = polyline_dist(pts_with_z, prev_idx, next_idx)
-        if d_total < 1e-6:
-            return prev_z
-        d_part = polyline_dist(pts_with_z, prev_idx, idx)
-        return prev_z + (d_part / d_total) * (next_z - prev_z)
-    elif prev_z is not None:
-        return prev_z
-    elif next_z is not None:
-        return next_z
-
-    return None
-
-
-def convert_lines_to_3d(msp, line_geometry, points_3d, search_radius):
-    """
-    Convert 2D line geometry to 3D polylines using nearby point elevations.
-    Equivalent to c:Lines23D LISP routine.
-    """
-    count = 0
-
-    for verts_2d, layer, category in line_geometry:
-        # Step 1: Assign nearest Z to each vertex (None if no nearby point)
-        pts_with_z = []
-        for vx, vy in verts_2d:
-            z = find_nearest_z((vx, vy), points_3d, search_radius)
-            pts_with_z.append((vx, vy, z))
-
-        # Step 2: Interpolate missing Z values along polyline path
-        for i in range(len(pts_with_z)):
-            if pts_with_z[i][2] is None:
-                interp = interpolate_z(i, pts_with_z)
-                if interp is not None:
-                    pts_with_z[i] = (pts_with_z[i][0], pts_with_z[i][1], interp)
-
-        # Step 3: Fill any remaining None with nearest known-Z vertex on same feature
-        for i in range(len(pts_with_z)):
-            if pts_with_z[i][2] is None:
-                best_z = None
-                best_d = 1e99
-                for j, (ox, oy, oz) in enumerate(pts_with_z):
-                    if oz is not None and i != j:
-                        d = dist_2d(pts_with_z[i], (ox, oy))
-                        if d < best_d:
-                            best_d = d
-                            best_z = oz
-                if best_z is not None:
-                    pts_with_z[i] = (pts_with_z[i][0], pts_with_z[i][1], best_z)
-
-        # Step 4: Finalize — replace any remaining None Z with 0.0
-        pts_with_z = [
-            (x, y, z if z is not None else 0.0) for x, y, z in pts_with_z
-        ]
-
-        # Step 5: Create 3D polyline
-        if len(pts_with_z) >= 2:
-            msp.add_polyline3d(
-                pts_with_z,
-                dxfattribs={"layer": LAYER_3D_LINES}
-            )
-            count += 1
-
-    print(f"  Created {count} 3D polylines on '{LAYER_3D_LINES}'")
-    return count
+    result = []
+    for verts_2d, layer in segments:
+        verts_3d = assign_z_to_vertices(verts_2d, terrain_pts, TERRAIN_SEARCH_RAD)
+        if len(verts_3d) >= 2:
+            result.append((verts_3d, layer))
+    return result
 
 
 # ---------------------------------------------------------------------------
-# Phase 3: Building pads — explode blocks, find outlines, elevate to FFL
+# Phase 5 – Building pads: collect outlines → merge by FFL → PLOTS FFL +
+#            PLOTS EXTERNAL LEVEL
 # ---------------------------------------------------------------------------
-
-def _is_outline_layer(layer_name):
-    """Return True if this layer should be treated as a building outline source."""
-    lu = layer_name.upper()
-    if classify_layer(layer_name) == "building":
-        return True
-    for pattern in BUILDING_OUTLINE_EXTRA_LAYERS:
-        if pattern.upper() in lu:
-            return True
-    return False
-
 
 def _chain_lines_to_outlines(lines, snap_tol=0.05):
-    """
-    Deduplicate and chain a list of ((x1,y1),(x2,y2)) LINE pairs into closed
-    polygons. Returns list of vertex lists for chains that close on themselves.
-    """
-    # Deduplicate by normalising each line's direction
+    """Chain ((x1,y1),(x2,y2)) LINE pairs into closed polygons."""
     seen = set()
     unique = []
     for a, b in lines:
         key = (round(min(a[0], b[0]), 3), round(min(a[1], b[1]), 3),
                round(max(a[0], b[0]), 3), round(max(a[1], b[1]), 3))
         if key not in seen:
-            seen.add(key)
-            unique.append((a, b))
+            seen.add(key); unique.append((a, b))
 
     if not unique:
         return []
@@ -631,310 +609,499 @@ def _chain_lines_to_outlines(lines, snap_tol=0.05):
             continue
         used.add(start)
         chain = list(segs[start])
-
         for _ in range(500):
             tk = snap(chain[-1])
             found = False
             for ni in head_map.get(tk, []):
                 if ni not in used:
-                    used.add(ni)
-                    chain.extend(segs[ni][1:])
-                    found = True
-                    break
+                    used.add(ni); chain.extend(segs[ni][1:]); found = True; break
             if not found:
                 for ni in tail_map.get(tk, []):
                     if ni not in used:
-                        used.add(ni)
-                        chain.extend(list(reversed(segs[ni]))[1:])
-                        found = True
-                        break
+                        used.add(ni); chain.extend(list(reversed(segs[ni]))[1:]); found = True; break
             if not found:
                 break
-
-        # Only keep chains that close on themselves
         if len(chain) >= 4 and dist_2d(chain[0], chain[-1]) <= snap_tol:
             closed_chains.append(chain)
 
     return closed_chains
 
 
-def collect_building_outlines(msp, doc):
+def _apply_insert_xform(bx, by, insert_x, insert_y, sx, sy, rot_deg):
     """
-    Collect building outline polygons, including those deeply nested inside
-    blocks and those formed by LINE entities on party-wall/outline layers.
-    Returns list of (vertices, layer_name).
+    Apply a DXF INSERT transformation (scale → rotate → translate) to a 2-D point.
+    Uses the standard DXF formula so it is correct even for negative-scale (mirrored) blocks.
     """
-    outlines = []
-    seen = set()  # Deduplicate by centroid
-
-    def add_outline(verts, layer):
-        if len(verts) < 3:
-            return
-        cx = round(sum(v[0] for v in verts) / len(verts), 3)
-        cy = round(sum(v[1] for v in verts) / len(verts), 3)
-        key = (cx, cy)
-        if key not in seen:
-            seen.add(key)
-            outlines.append((verts, layer))
-
-    # Collect LINE entities from outline layers inside blocks, grouped by layer
-    lines_by_layer = defaultdict(list)
-
-    # Recursively explode INSERT entities on building layers
-    for entity in msp:
-        if entity.dxftype() != "INSERT":
-            continue
-        if classify_layer(entity.dxf.layer) != "building":
-            continue
-
-        for sub in iter_virtual_deep(entity):
-            sl = sub.dxf.layer
-            if not _is_outline_layer(sl):
-                continue
-
-            if sub.dxftype() == "LWPOLYLINE":
-                verts = [(x, y) for x, y, *_ in sub.get_points()]
-                add_outline(verts, sl)
-
-            elif sub.dxftype() == "LINE":
-                s = sub.dxf.start
-                e = sub.dxf.end
-                length = math.sqrt((e.x - s.x) ** 2 + (e.y - s.y) ** 2)
-                if length > 0.01:
-                    lines_by_layer[sl].append(((s.x, s.y), (e.x, e.y)))
-
-    # Chain LINE entities into closed polygons, per layer
-    line_outlines = 0
-    for layer, lines in lines_by_layer.items():
-        for chain in _chain_lines_to_outlines(lines):
-            add_outline(chain, layer)
-            line_outlines += 1
-
-    # Direct polylines on building layers in modelspace
-    for entity in msp:
-        if entity.dxftype() == "LWPOLYLINE":
-            if classify_layer(entity.dxf.layer) == "building":
-                verts = [(x, y) for x, y, *_ in entity.get_points()]
-                add_outline(verts, entity.dxf.layer)
-
-    print(f"  Found {len(outlines)} building outlines "
-          f"({line_outlines} from chained LINE entities)")
-    return outlines
+    rot = math.radians(rot_deg)
+    cos_r = math.cos(rot)
+    sin_r = math.sin(rot)
+    wx = insert_x + sx * cos_r * bx - sy * sin_r * by
+    wy = insert_y + sx * sin_r * bx + sy * cos_r * by
+    return wx, wy
 
 
-def find_ffl_for_outline(outline_verts, ffl_data):
+def _block_outline_verts(doc, insert_entity):
     """
-    Find the FFL text that is inside or nearest to a building outline.
-    Uses simple centroid proximity matching.
+    Walk a single INSERT and its nested INSERTs, collecting building outline
+    polygons from PLOT OUTLINE INNER layers.  Transformations are applied
+    manually (avoids the ezdxf negative-scale transformation bug).
+
+    Two cases are handled:
+    1. Block has a closed LWPOLYLINE (≥3 pts) on the pad-source layer
+       → collect it directly.
+    2. Block only has 2-pt LWPOLYLINE segments (outer-wall pieces) on
+       PLOT OUTLINE INNER, and LINE entities on H-EXTERNAL PARTY WALL
+       (middle-of-terrace "MID" block types).  In this case the convex hull
+       of all segment endpoints is used to reconstruct the floor-area polygon.
+
+    Returns list of vertex lists, each already in world coordinates.
     """
-    # Calculate centroid of outline
-    cx = sum(v[0] for v in outline_verts) / len(outline_verts)
-    cy = sum(v[1] for v in outline_verts) / len(outline_verts)
+    results = []
 
-    # Also calculate bounding box for containment check
-    min_x = min(v[0] for v in outline_verts)
-    max_x = max(v[0] for v in outline_verts)
-    min_y = min(v[1] for v in outline_verts)
-    max_y = max(v[1] for v in outline_verts)
-
-    best_ffl = None
-    best_dist = float("inf")
-
-    for (fx, fy), elev, layer, is_ffl in ffl_data:
-        if not is_ffl:
-            continue
-
-        # Check if FFL text is inside bounding box (rough containment)
-        if min_x <= fx <= max_x and min_y <= fy <= max_y:
-            d = dist_2d((cx, cy), (fx, fy))
-            if d < best_dist:
-                best_dist = d
-                best_ffl = elev
-
-    # If no text inside bounding box, try proximity (within 20m of centroid)
-    if best_ffl is None:
-        for (fx, fy), elev, layer, is_ffl in ffl_data:
-            if not is_ffl:
-                continue
-            d = dist_2d((cx, cy), (fx, fy))
-            if d < 20.0 and d < best_dist:
-                best_dist = d
-                best_ffl = elev
-
-    return best_ffl
-
-
-def create_building_pads(msp, doc, elevation_data):
-    """
-    Create elevated building pad polylines from outlines + FFL text.
-    Equivalent to c:go LISP routine (but works without BOUNDARY command).
-    """
-    outlines = collect_building_outlines(msp, doc)
-    ffl_data = [d for d in elevation_data if d[3]]  # Only FFL entries
-
-    count = 0
-    no_ffl = 0
-    for verts, layer in outlines:
-        ffl = find_ffl_for_outline(verts, ffl_data)
-        if ffl is None:
-            no_ffl += 1
-            continue
-
-        # Create elevated polyline (all vertices at FFL elevation)
-        elevated_verts = [(x, y, ffl) for x, y in verts]
-        # Close it
-        if verts[0] != verts[-1]:
-            elevated_verts.append((verts[0][0], verts[0][1], ffl))
-
-        msp.add_polyline3d(
-            elevated_verts,
-            dxfattribs={"layer": LAYER_3D_BUILDING_PADS}
-        )
-        count += 1
-
-    if no_ffl:
-        print(f"  Warning: {no_ffl} outlines skipped (no FFL text found nearby)")
-    print(f"  Created {count} building pads on '{LAYER_3D_BUILDING_PADS}'")
-    return count
-
-
-# ---------------------------------------------------------------------------
-# Setup output layers / linetype cleanup
-# ---------------------------------------------------------------------------
-
-def cleanup_xref_linetypes(doc):
-    """
-    Fix or remove xref-dependent linetypes (names containing '|') that aren't
-    properly flagged. Civil 3D rejects these with 'LTYPE Table' errors.
-    """
-    linetypes_to_remove = []
-    for lt in doc.linetypes:
-        if '|' in lt.dxf.name:
-            linetypes_to_remove.append(lt.dxf.name)
-
-    if not linetypes_to_remove:
-        return
-
-    # Reassign any layers using these linetypes to "Continuous"
-    for layer in doc.layers:
-        lt_name = layer.dxf.get('linetype', '')
-        if lt_name in linetypes_to_remove:
-            layer.dxf.linetype = "Continuous"
-
-    # Remove the problematic linetypes
-    for name in linetypes_to_remove:
+    def recurse(ins, parent_xform):
+        """parent_xform = (ins_x, ins_y, sx, sy, rot_deg) of the chain so far."""
         try:
-            doc.linetypes.remove(name)
+            block = doc.blocks.get(ins.dxf.name)
         except Exception:
-            # If removal fails, fix the flags instead (set xref-dependent flag 16)
+            return
+        if block is None:
+            return
+
+        sx_ins  = ins.dxf.get("xscale", 1.0)
+        sy_ins  = ins.dxf.get("yscale", 1.0)
+        rot_ins = ins.dxf.get("rotation", 0.0)
+        tx_ins  = ins.dxf.insert.x
+        ty_ins  = ins.dxf.insert.y
+
+        closed_found = False   # True if any ≥3-pt LWPOLYLINE was collected
+        seg_pts = []           # endpoints from 2-pt segments / LINEs (MID case)
+
+        for entity in block:
             try:
-                lt = doc.linetypes.get(name)
-                lt.dxf.flags = lt.dxf.flags | 16
+                lyr = entity.dxf.layer
+            except Exception:
+                lyr = ""
+
+            is_inner  = _is_pad_source_layer(lyr)
+            # Party-wall LINEs are needed to close the outline for MID blocks.
+            # Use H-EXTERNAL PARTY WALL (not the 352 variant, which is the
+            # outer dimensioned line and would skew the outline slightly).
+            is_party  = ("EXTERNAL PARTY WALL" in lyr.upper()
+                         and "352" not in lyr.upper())
+
+            if entity.dxftype() == "LWPOLYLINE" and is_inner:
+                raw = [(x, y) for x, y, *_ in entity.get_points()]
+                step1 = [_apply_insert_xform(bx, by, tx_ins, ty_ins,
+                                              sx_ins, sy_ins, rot_ins)
+                         for bx, by in raw]
+                px, py, psx, psy, prot = parent_xform
+                step2 = [_apply_insert_xform(wx, wy, px, py, psx, psy, prot)
+                         for wx, wy in step1]
+                if len(step2) >= 3:
+                    results.append(step2)
+                    closed_found = True
+                else:
+                    # 2-pt segment: collect endpoints for convex-hull fallback
+                    seg_pts.extend(step2)
+
+            elif entity.dxftype() == "LINE" and (is_inner or is_party):
+                for pt_local in [(entity.dxf.start.x, entity.dxf.start.y),
+                                 (entity.dxf.end.x,   entity.dxf.end.y)]:
+                    s1 = _apply_insert_xform(pt_local[0], pt_local[1],
+                                             tx_ins, ty_ins,
+                                             sx_ins, sy_ins, rot_ins)
+                    px, py, psx, psy, prot = parent_xform
+                    s2 = _apply_insert_xform(s1[0], s1[1], px, py, psx, psy, prot)
+                    seg_pts.append(s2)
+
+            elif entity.dxftype() == "INSERT":
+                recurse(entity, (tx_ins, ty_ins, sx_ins, sy_ins, rot_ins))
+
+        # MID-block fallback: build convex hull from all segment endpoints
+        if not closed_found and len(seg_pts) >= 3:
+            try:
+                from shapely.geometry import MultiPoint
+                hull = MultiPoint(seg_pts).convex_hull
+                if hull.geom_type == "Polygon" and not hull.is_empty:
+                    results.append(list(hull.exterior.coords))
             except Exception:
                 pass
 
-    print(f"  Cleaned up {len(linetypes_to_remove)} xref-dependent linetypes")
+    # The top-level INSERT has no parent transform (identity)
+    recurse(insert_entity, (0.0, 0.0, 1.0, 1.0, 0.0))
+    return results
 
 
-def setup_output_layers(doc):
-    """Create the output layers with appropriate colors."""
-    layers = doc.layers
+def collect_building_outlines(msp, doc):
+    """
+    Collect building plot outlines as (vertices_2d, layer_name) pairs.
+    Only H-PLOT OUTLINE INNER (and similar BUILDING_OUTLINE_LAYERS) LWPOLYLINEs
+    are used; party-wall LINE entities are ignored.
+    Transformations for nested blocks are applied manually to avoid the ezdxf
+    negative-scale (mirrored INSERT) transformation bug.
+    """
+    outlines = []
+    seen = set()
 
-    for name, color in [
-        (LAYER_3D_POINTS, COLOR_POINTS),
-        (LAYER_3D_LINES, COLOR_LINES),
-        (LAYER_3D_BUILDING_PADS, COLOR_PADS),
-    ]:
-        if name not in layers:
-            layers.add(name, color=color)
+    def add(verts, layer):
+        if len(verts) < 3:
+            return
+        cx = round(sum(v[0] for v in verts) / len(verts), 2)
+        cy = round(sum(v[1] for v in verts) / len(verts), 2)
+        if (cx, cy) not in seen:
+            seen.add((cx, cy))
+            outlines.append((verts, layer))
+
+    # Direct LWPOLYLINE entities in modelspace
+    for entity in msp:
+        if entity.dxftype() == "LWPOLYLINE" and _is_pad_source_layer(entity.dxf.layer):
+            add([(x, y) for x, y, *_ in entity.get_points()], entity.dxf.layer)
+
+    # Geometry inside INSERT blocks (all INSERT entities, any layer)
+    for entity in msp:
+        if entity.dxftype() != "INSERT":
+            continue
+        for verts in _block_outline_verts(doc, entity):
+            add(verts, BUILDING_OUTLINE_LAYERS[0])
+
+    return outlines
 
 
-def set_units_metres(doc):
-    """Set DXF drawing units to metres (INSUNITS=6, MEASUREMENT=1)."""
-    doc.header['$INSUNITS'] = 6    # 6 = Metres
-    doc.header['$MEASUREMENT'] = 1  # 1 = Metric
+def _to_shapely_polygon(verts):
+    """Convert a vertex list to a Shapely Polygon. Returns None on failure."""
+    try:
+        poly = Polygon(verts)
+        if not poly.is_valid:
+            poly = poly.buffer(0)   # fix self-intersections
+        return poly if not poly.is_empty else None
+    except Exception:
+        return None
+
+
+def assign_ffl_and_merge(outlines, ffl_annotations):
+    """
+    Group plot outlines by their FFL value and union adjacent same-FFL plots.
+
+    ffl_annotations: list of ((x, y), ffl_value)
+
+    Returns list of (shapely_polygon, ffl_value).
+
+    Algorithm:
+      Pass 1 – assign the FFL annotation to the nearest polygon (within FFL_PROXIMITY).
+               Ties broken by distance; each annotation claims at most one polygon,
+               each polygon keeps only its first (closest) assignment.
+      Pass 2 – BFS flood-fill: propagates FFL outward from annotated polygons
+               to unassigned neighbours within ADJACENCY_TOL, in geographic order
+               (nearest-first), so that each plot gets the FFL of the nearest
+               annotated polygon reachable through adjacency.
+      Pass 3 – narrow fallback: any polygon still unassigned is given the FFL
+               of the nearest annotation within FFL_PROXIMITY (5 m).  Polygons
+               more than 5 m from every annotation are silently dropped.
+    Merging:
+      Within each FFL group, plots are buffered by WALL_BUFFER (≈ wall thickness)
+      so that adjacent inner-floor-area polygons touch, then unioned.  The result
+      is simplified to give clean low-vertex-count polygons that approximate the
+      outer wall boundary.  No convex-hull bridging is used: that produced
+      high-vertex artefacts that did not match the reference geometry.
+    """
+    # Build shapely polygons
+    polys = []
+    for verts, _layer in outlines:
+        poly = _to_shapely_polygon(verts)
+        if poly is not None and not poly.is_empty:
+            polys.append(poly)
+
+    if not polys:
+        return []
+
+    n = len(polys)
+    ffl_assigned = [None] * n
+
+    # ------------------------------------------------------------------
+    # Pass 1 – assign the nearest polygon to each FFL annotation
+    # ------------------------------------------------------------------
+    FFL_PROXIMITY = 5.0   # metres — annotation may sit in road/garden between plots
+    for (fx, fy), ffl_val in ffl_annotations:
+        pt = Point(fx, fy)
+        best_i, best_d = None, FFL_PROXIMITY
+        for i, poly in enumerate(polys):
+            if poly.contains(pt):
+                d = 0.0
+            else:
+                d = poly.distance(pt)
+            if d < best_d:
+                best_d, best_i = d, i
+        if best_i is not None and ffl_assigned[best_i] is None:
+            ffl_assigned[best_i] = ffl_val
+
+    # ------------------------------------------------------------------
+    # Pass 2 – BFS flood-fill through adjacent polygons
+    # Build adjacency list first (O(n²) is fine for n≈62)
+    # ------------------------------------------------------------------
+    adj = [[] for _ in range(n)]
+    for i in range(n):
+        for j in range(i + 1, n):
+            if polys[i].distance(polys[j]) < ADJACENCY_TOL:
+                adj[i].append(j)
+                adj[j].append(i)
+
+    # Initialise BFS queue with all annotated polygons
+    queue = deque()
+    for i in range(n):
+        if ffl_assigned[i] is not None:
+            queue.append(i)
+
+    while queue:
+        i = queue.popleft()
+        for j in adj[i]:
+            if ffl_assigned[j] is None:
+                ffl_assigned[j] = ffl_assigned[i]
+                queue.append(j)
+
+    # ------------------------------------------------------------------
+    # Pass 3 – narrow fallback: nearest annotation within FFL_PROXIMITY
+    # ------------------------------------------------------------------
+    for i in range(n):
+        if ffl_assigned[i] is not None:
+            continue
+        cx, cy = polys[i].centroid.x, polys[i].centroid.y
+        best_ffl, best_d = None, FFL_PROXIMITY
+        for (fx, fy), ffl_val in ffl_annotations:
+            d = dist_2d((cx, cy), (fx, fy))
+            if d < best_d:
+                best_d, best_ffl = d, ffl_val
+        ffl_assigned[i] = best_ffl   # may remain None → dropped below
+
+    # ------------------------------------------------------------------
+    # Group and merge
+    # ------------------------------------------------------------------
+    groups = defaultdict(list)
+    for i, ffl_val in enumerate(ffl_assigned):
+        if ffl_val is not None:
+            groups[ffl_val].append(polys[i])
+
+    result = []
+    for ffl_val, group_polys in groups.items():
+        # Apply convex_hull to each individual inner polygon first so that
+        # duplicate/near-duplicate polygons (e.g. two coincident LWPOLYLINEs
+        # in the same block) don't produce complex buffer shapes.
+        # Then expand by WALL_BUFFER to approximate the outer wall face and
+        # union adjacent plots.  No global convex_hull is applied to the merged
+        # result so that non-convex (e.g. L-shaped) terrace footprints are
+        # preserved.  A gentle opening removes thin artefacts; simplification
+        # reduces vertex count to match the reference (~4–7 verts).
+        expanded  = [p.convex_hull.buffer(WALL_BUFFER) for p in group_polys]
+        merged    = unary_union(expanded)
+        # Opening: remove thin slivers produced by the buffer
+        merged    = merged.buffer(-0.01).buffer(0.01)
+        parts = list(merged.geoms) if merged.geom_type == "MultiPolygon" else [merged]
+        for part in parts:
+            if not part.is_empty:
+                final = part.simplify(SIMPLIFY_TOL, preserve_topology=False)
+                result.append((final if not final.is_empty else part, ffl_val))
+
+    return result
+
+
+def generate_pad_polylines(merged_pads, terrain_pts):
+    """
+    For each (merged_polygon, ffl_value):
+      - PLOTS FFL:            exterior inset by FFL_OFFSET, all Z = ffl_value
+      - PLOTS EXTERNAL LEVEL: exterior coords with Z from terrain
+
+    Returns two lists: ffl_polylines, external_polylines.
+    Each entry is a list of (x, y, z).
+    """
+    ffl_polys = []
+    ext_polys  = []
+    skipped    = 0
+
+    for poly, ffl_val in merged_pads:
+        # --- PLOTS EXTERNAL LEVEL: original exterior with terrain Z ---
+        ext_ring = list(poly.exterior.coords)
+        ext_3d = assign_z_to_ring(
+            [(x, y) for x, y in ext_ring],
+            terrain_pts,
+            TERRAIN_SEARCH_RAD
+        )
+        if len(ext_3d) >= 2:
+            ext_polys.append(ext_3d)
+
+        # --- PLOTS FFL: inward offset, constant Z = ffl_val ---
+        try:
+            inner = poly.buffer(-FFL_OFFSET)
+            if inner.is_empty:
+                inner = poly   # degenerate — use original
+        except Exception:
+            inner = poly
+
+        # Re-simplify after the inset buffer to remove spurious vertices that
+        # the inward buffer can introduce on concave boundaries.
+        if inner.geom_type == "Polygon":
+            inner2 = inner.simplify(0.10, preserve_topology=False)
+            if not inner2.is_empty:
+                inner = inner2
+
+        if inner.geom_type == "MultiPolygon":
+            inner_parts = list(inner.geoms)
+        elif inner.geom_type == "Polygon":
+            inner_parts = [inner]
+        else:
+            inner_parts = [poly]
+
+        for ip in inner_parts:
+            coords = list(ip.exterior.coords)
+            if len(coords) < 2:
+                continue
+            ffl_polys.append([(x, y, ffl_val) for x, y in coords])
+
+    print(f"  Merged pads: {len(merged_pads)}  →  "
+          f"{len(ffl_polys)} PLOTS FFL, {len(ext_polys)} PLOTS EXTERNAL LEVEL"
+          + (f"  ({skipped} skipped)" if skipped else ""))
+    return ffl_polys, ext_polys
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 – Build a clean output DXF and populate it
+# ---------------------------------------------------------------------------
+
+def create_output_doc(source_doc):
+    """
+    Create a fresh ezdxf document with only the 4 output layers.
+    Copies INSUNITS / MEASUREMENT from the source.
+    """
+    out = ezdxf.new("R2010")
+
+    # Copy units
+    for var in ("$INSUNITS", "$MEASUREMENT"):
+        try:
+            out.header[var] = source_doc.header[var]
+        except Exception:
+            pass
+
+    # Define output layers
+    for name, color in (
+        (LAYER_PLOTS_FFL,      5),   # blue
+        (LAYER_PLOTS_EXTERNAL, 6),   # magenta
+        (LAYER_3D_LINES,       3),   # green
+        (LAYER_3D_POINTS,      1),   # red
+    ):
+        out.layers.add(name, color=color)
+
+    return out
+
+
+def write_entities(out_msp, ffl_polys, ext_polys, line_polys_3d, terrain_pts_xyz):
+    """Write all generated geometry to the output modelspace."""
+
+    for verts in ffl_polys:
+        out_msp.add_polyline3d(verts, dxfattribs={"layer": LAYER_PLOTS_FFL})
+
+    for verts in ext_polys:
+        out_msp.add_polyline3d(verts, dxfattribs={"layer": LAYER_PLOTS_EXTERNAL})
+
+    for verts, _layer in line_polys_3d:
+        out_msp.add_polyline3d(verts, dxfattribs={"layer": LAYER_3D_LINES})
+
+    for x, y, z in terrain_pts_xyz:
+        out_msp.add_point((x, y, z), dxfattribs={"layer": LAYER_3D_POINTS})
+
+    print(f"  Wrote {len(ffl_polys)} PLOTS FFL polylines")
+    print(f"  Wrote {len(ext_polys)} PLOTS EXTERNAL LEVEL polylines")
+    print(f"  Wrote {len(line_polys_3d)} 3D_LINES polylines")
+    print(f"  Wrote {len(terrain_pts_xyz)} 3D_Points")
+
+
+# ---------------------------------------------------------------------------
+# Xref linetype cleanup (carried forward for compatibility)
+# ---------------------------------------------------------------------------
+
+def cleanup_xref_linetypes(doc):
+    """Remove xref-dependent linetypes (names containing '|')."""
+    to_remove = [lt.dxf.name for lt in doc.linetypes if "|" in lt.dxf.name]
+    if not to_remove:
+        return
+    for layer in doc.layers:
+        if layer.dxf.get("linetype", "") in to_remove:
+            layer.dxf.linetype = "Continuous"
+    removed = 0
+    for name in to_remove:
+        try:
+            doc.linetypes.remove(name)
+            removed += 1
+        except Exception:
+            pass
+    print(f"  Cleaned {removed} xref-dependent linetypes")
 
 
 # ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
 
-def run_pipeline(input_path, output_path, search_radius=5.0):
-    """Run the full DXF → 3D pipeline."""
-
+def run_pipeline(input_path, output_path):
     print(f"\n{'='*60}")
-    print(f"  External Works DXF → 3D Pipeline")
+    print(f"  External Works DXF → 3D Pipeline  (v2)")
     print(f"{'='*60}")
     print(f"  Input:  {input_path}")
     print(f"  Output: {output_path}")
-    print(f"  Search radius: {search_radius}m")
     print(f"{'='*60}\n")
 
-    # Load DXF
-    print("[1/8] Loading DXF file...")
+    # ── Load ─────────────────────────────────────────────────────────────────
+    print("[1/8] Loading source DXF...")
     doc = ezdxf.readfile(input_path)
     msp = doc.modelspace()
+    print(f"  {len(list(msp))} entities, {len(doc.layers)} layers\n")
 
-    entity_count = len(list(msp))
-    layer_count = len(doc.layers)
-    print(f"  Loaded: {entity_count} entities, {layer_count} layers\n")
-
-    # Set output units to metres
-    print("[2/8] Setting drawing units to metres...")
-    set_units_metres(doc)
-    print()
-
-    # Cleanup xref-dependent linetypes (Civil 3D rejects these)
-    print("[3/8] Cleaning up xref-dependent linetypes...")
+    print("[2/8] Cleaning xref linetypes...")
     cleanup_xref_linetypes(doc)
     print()
 
-    # Setup output layers
-    print("[4/8] Setting up output layers...")
-    setup_output_layers(doc)
+    # ── Elevation text ───────────────────────────────────────────────────────
+    print("[3/8] Collecting elevation text...")
+    elevation_data = collect_elevation_text(msp)
+    ffl_data  = [(xy, elev) for xy, elev, _l, is_ffl in elevation_data if is_ffl]
+    spot_data = [(xy, elev) for xy, elev, _l, is_ffl in elevation_data if not is_ffl]
+    print(f"  {len(ffl_data)} FFL annotations, {len(spot_data)} spot levels")
+    terrain_pts = build_terrain_points(elevation_data)
+    if terrain_pts:
+        zs = [z for _, _, z in terrain_pts]
+        print(f"  Elevation range: {min(zs):.3f} – {max(zs):.3f} m")
     print()
 
-    # Phase 1: Extract elevation text and create 3D points
-    print("[5/8] Extracting elevation text and creating 3D points...")
-    elevation_data = collect_elevation_text(msp, doc)
-    print(f"  Found {len(elevation_data)} elevation text entities")
+    # ── Line geometry ─────────────────────────────────────────────────────────
+    print("[4/8] Collecting drive / fence / road line geometry...")
+    raw_segs = collect_line_geometry(msp)
+    print(f"  {len(raw_segs)} raw segments\n")
 
-    ffl_count = sum(1 for d in elevation_data if d[3])
-    spot_count = len(elevation_data) - ffl_count
-    print(f"    - {spot_count} spot levels")
-    print(f"    - {ffl_count} FFL values")
+    print("[5/8] Inserting spot vertices, chaining, elevating...")
+    segs = insert_spot_vertices(raw_segs, terrain_pts, TERRAIN_SEARCH_RAD)
+    segs = chain_segments(segs)
+    print(f"  {len(segs)} chained polylines")
+    line_polys_3d = elevate_line_geometry(segs, terrain_pts)
+    print(f"  {len(line_polys_3d)} 3D_LINES polylines\n")
 
-    if elevation_data:
-        elevations = [d[1] for d in elevation_data]
-        print(f"    - Elevation range: {min(elevations):.3f}m – {max(elevations):.3f}m")
+    # ── Building pads ─────────────────────────────────────────────────────────
+    print("[6/8] Collecting building outlines...")
+    outlines = collect_building_outlines(msp, doc)
+    print(f"  {len(outlines)} outlines found\n")
 
-    points_3d = create_3d_points(msp, elevation_data)
+    print("[7/8] Merging adjacent same-FFL plots, generating pad polylines...")
+    merged_pads = assign_ffl_and_merge(outlines, ffl_data)
+    no_ffl = len(outlines) - sum(
+        1 for _, ffl_val in [(p, f) for p, f in merged_pads]
+    )
+    ffl_polys, ext_polys = generate_pad_polylines(merged_pads, terrain_pts)
     print()
 
-    # Phase 2: Collect geometry, insert intermediate vertices, chain, convert to 3D
-    print("[6/8] Collecting line/arc geometry...")
-    raw_segments = collect_line_geometry(msp, ["drive", "fence", "road"])
-    print()
-
-    print("[7/8] Inserting intermediate vertices and chaining segments...")
-    segments = insert_spot_vertices(raw_segments, elevation_data, search_radius)
-    segments = chain_segments(segments)
-    print(f"  Chained into {len(segments)} continuous polylines")
-    convert_lines_to_3d(msp, segments, points_3d, search_radius)
-    print()
-
-    # Phase 3: Building pads
-    print("[8/8] Creating building pads...")
-    create_building_pads(msp, doc, elevation_data)
-    print()
-
-    # Save output
-    print(f"Saving output to: {output_path}")
-    doc.saveas(output_path)
+    # ── Write output ──────────────────────────────────────────────────────────
+    print("[8/8] Writing output DXF...")
+    out_doc = create_output_doc(doc)
+    out_msp = out_doc.modelspace()
+    write_entities(out_msp, ffl_polys, ext_polys, line_polys_3d, terrain_pts)
+    out_doc.saveas(output_path)
 
     print(f"\n{'='*60}")
-    print(f"  Pipeline complete!")
-    print(f"  Open {output_path} in Civil 3D to review.")
+    print(f"  Done →  {output_path}")
     print(f"{'='*60}\n")
 
 
@@ -944,14 +1111,11 @@ def run_pipeline(input_path, output_path, search_radius=5.0):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python pipeline.py <input.dxf> [output.dxf] [search_radius]")
-        print("  input.dxf      - Input DXF file path")
-        print("  output.dxf     - Output file (default: <input>_3D_Output.dxf)")
-        print("  search_radius  - Radius in meters for Z assignment (default: 5.0)")
+        print("Usage: python pipeline.py <input.dxf> [output.dxf]")
         sys.exit(1)
 
-    input_file = sys.argv[1]
-    output_file = sys.argv[2] if len(sys.argv) > 2 else input_file.replace(".dxf", "_3D_Output.dxf")
-    radius = float(sys.argv[3]) if len(sys.argv) > 3 else 5.0
+    input_file  = sys.argv[1]
+    output_file = (sys.argv[2] if len(sys.argv) > 2
+                   else input_file.replace(".dxf", "_3D_Output.dxf"))
 
-    run_pipeline(input_file, output_file, radius)
+    run_pipeline(input_file, output_file)
