@@ -247,12 +247,83 @@ def compare_3d_lines(out_path, ref_path):
     print()
 
 
+# ── Assessment 3: PLOTS EXTERNAL LEVEL Z ─────────────────────────────────────
+
+def compare_external_level(out_path, ref_path):
+    print("=" * 64)
+    print("  ASSESSMENT 3 — PLOTS EXTERNAL LEVEL Z accuracy (pad terrain)")
+    print(f"  XY snap: 1000 mm  |  Z OK ≤ {LINES_Z_OK_M*1000:.0f} mm"
+          f"  |  Z WARN ≤ {LINES_Z_WARN_M*1000:.0f} mm")
+    print("=" * 64)
+
+    out_polys = read_layer_polys_xyz(out_path, "PLOTS EXTERNAL LEVEL")
+    ref_polys = read_layer_polys_xyz(ref_path, "PLOTS EXTERNAL LEVEL")
+
+    print(f"  Output: {len(out_polys)} pads   Reference: {len(ref_polys)} pads\n")
+
+    if not out_polys or not ref_polys:
+        print("  [WARN] No EXTERNAL LEVEL polylines found in one or both files.\n")
+        return
+
+    # Build centroid index to match output → reference pads
+    def centroid_xy(verts):
+        xs = [x for x, y, z in verts]
+        ys = [y for x, y, z in verts]
+        return sum(xs) / len(xs), sum(ys) / len(ys)
+
+    out_c = [centroid_xy(v) for v in out_polys]
+    ref_c = [centroid_xy(v) for v in ref_polys]
+
+    # Build spatial grid on output vertices for XY matching
+    all_out_verts = [(x, y, z) for v in out_polys for x, y, z in v]
+    grid, cell = build_grid(all_out_verts, cell=1.0)
+
+    XY_SNAP = 1.0  # wider snap for pad boundary (shapes may differ slightly)
+    z_errors = []
+    unmatched = 0
+
+    for ref_v in ref_polys:
+        for rx, ry, rz in ref_v:
+            _dxy, oz = nearest_in_grid(rx, ry, all_out_verts, grid, cell, XY_SNAP)
+            if oz is not None:
+                z_errors.append(abs(rz - oz))
+            else:
+                unmatched += 1
+
+    if not z_errors:
+        print("  [WARN] No vertex pairs found within XY snap.\n")
+        return
+
+    n = len(z_errors)
+    ok_n   = sum(1 for e in z_errors if e <= LINES_Z_OK_M)
+    warn_n = sum(1 for e in z_errors if LINES_Z_OK_M < e <= LINES_Z_WARN_M)
+    fail_n = sum(1 for e in z_errors if e > LINES_Z_WARN_M)
+
+    print(f"  Matched vertices : {n}   Unmatched (>1000 mm XY): {unmatched}")
+    print(f"  Mean  |ΔZ| : {sum(z_errors)/n*1000:6.1f} mm")
+    print(f"  Median|ΔZ| : {sorted(z_errors)[n//2]*1000:6.1f} mm")
+    print(f"  Max   |ΔZ| : {max(z_errors)*1000:6.1f} mm")
+    print(f"  OK  (≤{LINES_Z_OK_M*1000:.0f} mm)  : {ok_n:4d}  ({100*ok_n/n:5.1f}%)")
+    print(f"  WARN (≤{LINES_Z_WARN_M*1000:.0f} mm) : {warn_n:4d}  ({100*warn_n/n:5.1f}%)")
+    print(f"  FAIL (>{LINES_Z_WARN_M*1000:.0f} mm)  : {fail_n:4d}  ({100*fail_n/n:5.1f}%)")
+
+    paired = sorted(zip(z_errors,
+                        [(x, y, z) for v in ref_polys for x, y, z in v]),
+                    key=lambda x: x[0], reverse=True)
+    print(f"\n  Worst 10 EXTERNAL LEVEL Z errors:")
+    print(f"  {'XY position':>30}  ref_Z    |ΔZ|")
+    for dz, (rx, ry, rz) in paired[:10]:
+        print(f"  ({rx:10.2f}, {ry:10.2f})         {rz:7.3f}  {dz*1000:6.1f} mm")
+    print()
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     out = sys.argv[1] if len(sys.argv) > 1 else OUTPUT
     ref = sys.argv[2] if len(sys.argv) > 2 else REF
     compare_plots_ffl(out, ref)
+    compare_external_level(out, ref)
     compare_3d_lines(out, ref)
 
 

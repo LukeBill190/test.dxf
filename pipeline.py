@@ -25,6 +25,13 @@ from collections import defaultdict, deque
 from shapely.geometry import Polygon, Point, MultiPolygon
 from shapely.ops import unary_union
 
+try:
+    import numpy as _np
+    from scipy.interpolate import LinearNDInterpolator as _LNDI
+    _HAS_SCIPY = True
+except ImportError:
+    _HAS_SCIPY = False
+
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -240,6 +247,46 @@ def find_nearest_z(px, py, points_3d, radius):
     return best_z
 
 
+def build_tin(terrain_pts):
+    """
+    Build a Triangulated Irregular Network (TIN) surface interpolator from a
+    list of (x, y, z) terrain points using Scipy's Delaunay triangulation.
+
+    Returns a callable TIN interpolator, or None if scipy is unavailable or
+    there are fewer than 3 non-collinear terrain points.
+
+    Usage:
+        tin = build_tin(terrain_pts)
+        z   = query_tin(px, py, tin, terrain_pts)
+    """
+    if not _HAS_SCIPY or len(terrain_pts) < 3:
+        return None
+    try:
+        xy = _np.array([(x, y) for x, y, z in terrain_pts], dtype=float)
+        z  = _np.array([z      for x, y, z in terrain_pts], dtype=float)
+        interp = _LNDI(xy, z)
+        return interp
+    except Exception:
+        return None
+
+
+def query_tin(px, py, tin, fallback_pts, fallback_radius=TERRAIN_SEARCH_RAD):
+    """
+    Return an interpolated Z at (px, py) from the TIN surface.
+    Falls back to nearest-point search if:
+      - tin is None (scipy not available or too few points)
+      - (px, py) lies outside the convex hull of the triangulation (returns NaN)
+    """
+    if tin is not None:
+        try:
+            z = float(tin(_np.array([[px, py]]))[0])
+            if not math.isnan(z):
+                return z
+        except Exception:
+            pass
+    return find_nearest_z(px, py, fallback_pts, fallback_radius)
+
+
 def _polyline_dist(pts, from_idx, to_idx):
     d = 0.0
     for k in range(from_idx, to_idx):
@@ -306,11 +353,15 @@ def assign_z_to_vertices(verts_2d, points_3d, search_radius=TERRAIN_SEARCH_RAD):
     return [(x, y, z if z is not None else 0.0) for x, y, z in pts]
 
 
-def assign_z_to_ring(ring_2d, points_3d, search_radius=TERRAIN_SEARCH_RAD):
+def assign_z_to_ring(ring_2d, points_3d, search_radius=TERRAIN_SEARCH_RAD, tin=None):
     """
     Like assign_z_to_vertices but treats the input as a closed ring —
     wraps around for interpolation so the last vertex can borrow from
     the first and vice-versa.
+
+    When a TIN interpolator is supplied each vertex Z is obtained from the
+    triangulated surface (more accurate than nearest-point between spot levels);
+    vertices outside the TIN convex hull fall back to nearest-point lookup.
     """
     # Duplicate ring for wrap-around interpolation
     ring = list(ring_2d)
@@ -318,8 +369,8 @@ def assign_z_to_ring(ring_2d, points_3d, search_radius=TERRAIN_SEARCH_RAD):
     if closed:
         ring = ring[:-1]   # strip repeated closing vertex
 
-    # Direct lookup
-    pts = [(x, y, find_nearest_z(x, y, points_3d, search_radius))
+    # Direct TIN (or nearest-point fallback) lookup for each vertex
+    pts = [(x, y, query_tin(x, y, tin, points_3d, search_radius))
            for x, y in ring]
 
     n = len(pts)
@@ -558,7 +609,7 @@ def chain_segments(segments, snap_tol=CHAIN_SNAP_TOL):
     return result
 
 
-def assign_z_spot_owned(verts_2d, terrain_pts, search_radius=TERRAIN_SEARCH_RAD):
+def assign_z_spot_owned(verts_2d, terrain_pts, search_radius=TERRAIN_SEARCH_RAD, tin=None):
     """
     Elevation model for open polylines (drives, fences, roads).
 
@@ -574,12 +625,11 @@ def assign_z_spot_owned(verts_2d, terrain_pts, search_radius=TERRAIN_SEARCH_RAD)
       cumulative path length, as specified for intermediate vertices between
       surveyed spot levels.
 
-    Phase 3 – Wide nearest-terrain fallback (search_radius):
-      Vertices not claimed by any terrain point in Phase 1 (i.e. no terrain
-      point chose them as its nearest vertex) receive Z from the nearest terrain
-      point within search_radius.  This covers polyline endpoints and vertices
-      in gaps between spot levels that interpolation cannot reach (no known Z
-      on one side).
+    Phase 3 – TIN / nearest-terrain fallback (search_radius):
+      Vertices not claimed by any terrain point in Phase 1 receive Z from the
+      TIN surface (or nearest-point if outside the TIN hull).  This covers
+      polyline endpoints and vertices in gaps where interpolation cannot reach
+      (no known Z on one side).
 
     Phase 4 – Nearest-Z-in-polyline:
       Last resort for polylines entirely outside terrain coverage.
@@ -618,10 +668,10 @@ def assign_z_spot_owned(verts_2d, terrain_pts, search_radius=TERRAIN_SEARCH_RAD)
             if z is not None:
                 pts[i] = (pts[i][0], pts[i][1], z)
 
-    # ── Phase 3: nearest-terrain fallback for unclaimed vertices ─────────────
+    # ── Phase 3: TIN / nearest-terrain fallback for unclaimed vertices ────────
     for i in range(n):
         if pts[i][2] is None:
-            z = find_nearest_z(pts[i][0], pts[i][1], terrain_pts, search_radius)
+            z = query_tin(pts[i][0], pts[i][1], tin, terrain_pts, search_radius)
             if z is not None:
                 pts[i] = (pts[i][0], pts[i][1], z)
 
@@ -640,14 +690,14 @@ def assign_z_spot_owned(verts_2d, terrain_pts, search_radius=TERRAIN_SEARCH_RAD)
     return [(x, y, z if z is not None else 0.0) for x, y, z in pts]
 
 
-def elevate_line_geometry(segments, terrain_pts):
+def elevate_line_geometry(segments, terrain_pts, tin=None):
     """
     Assign Z to every vertex in every segment using the spot-owned model.
     Returns list of ([(x,y,z), ...], layer_name).
     """
     result = []
     for verts_2d, layer in segments:
-        verts_3d = assign_z_spot_owned(verts_2d, terrain_pts)
+        verts_3d = assign_z_spot_owned(verts_2d, terrain_pts, tin=tin)
         if len(verts_3d) >= 2:
             result.append((verts_3d, layer))
     return result
@@ -985,11 +1035,11 @@ def assign_ffl_and_merge(outlines, ffl_annotations):
     return result
 
 
-def generate_pad_polylines(merged_pads, terrain_pts):
+def generate_pad_polylines(merged_pads, terrain_pts, tin=None):
     """
     For each (merged_polygon, ffl_value):
       - PLOTS FFL:            exterior inset by FFL_OFFSET, all Z = ffl_value
-      - PLOTS EXTERNAL LEVEL: exterior coords with Z from terrain
+      - PLOTS EXTERNAL LEVEL: exterior coords with Z from TIN terrain surface
 
     Returns two lists: ffl_polylines, external_polylines.
     Each entry is a list of (x, y, z).
@@ -999,12 +1049,13 @@ def generate_pad_polylines(merged_pads, terrain_pts):
     skipped    = 0
 
     for poly, ffl_val in merged_pads:
-        # --- PLOTS EXTERNAL LEVEL: original exterior with terrain Z ---
+        # --- PLOTS EXTERNAL LEVEL: original exterior with TIN terrain Z ---
         ext_ring = list(poly.exterior.coords)
         ext_3d = assign_z_to_ring(
             [(x, y) for x, y in ext_ring],
             terrain_pts,
-            TERRAIN_SEARCH_RAD
+            TERRAIN_SEARCH_RAD,
+            tin=tin
         )
         if len(ext_3d) >= 2:
             ext_polys.append(ext_3d)
@@ -1149,6 +1200,9 @@ def run_pipeline(input_path, output_path):
         zs = [z for _, _, z in terrain_pts]
         print(f"  Elevation range: {min(zs):.3f} – {max(zs):.3f} m")
 
+    # Build TIN once for use throughout the pipeline
+    tin = build_tin(terrain_pts)
+    print(f"  TIN: {'built from ' + str(len(terrain_pts)) + ' pts' if tin is not None else 'unavailable (scipy missing)'}")
     print()
 
     # ── Line geometry ─────────────────────────────────────────────────────────
@@ -1160,7 +1214,7 @@ def run_pipeline(input_path, output_path):
     segs = insert_spot_vertices(raw_segs, terrain_pts, TERRAIN_SEARCH_RAD)
     segs = chain_segments(segs)
     print(f"  {len(segs)} chained polylines")
-    line_polys_3d = elevate_line_geometry(segs, terrain_pts)
+    line_polys_3d = elevate_line_geometry(segs, terrain_pts, tin=tin)
     print(f"  {len(line_polys_3d)} 3D_LINES polylines\n")
 
     # ── Building pads ─────────────────────────────────────────────────────────
@@ -1173,7 +1227,7 @@ def run_pipeline(input_path, output_path):
     no_ffl = len(outlines) - sum(
         1 for _, ffl_val in [(p, f) for p, f in merged_pads]
     )
-    ffl_polys, ext_polys = generate_pad_polylines(merged_pads, terrain_pts)
+    ffl_polys, ext_polys = generate_pad_polylines(merged_pads, terrain_pts, tin=tin)
     print()
 
     # ── Write output ──────────────────────────────────────────────────────────
