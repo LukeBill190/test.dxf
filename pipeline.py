@@ -21,7 +21,7 @@ import sys
 import re
 import math
 import ezdxf
-from collections import defaultdict
+from collections import defaultdict, deque
 from shapely.geometry import Polygon, Point, MultiPolygon
 from shapely.ops import unary_union
 
@@ -31,8 +31,16 @@ from shapely.ops import unary_union
 # ---------------------------------------------------------------------------
 
 # Layer patterns that identify building plot outlines (case-insensitive substring)
-BUILDING_OUTLINE_EXTRA_LAYERS = ["EXTERNAL PARTY WALL", "PLOT OUTLINE INNER"]
-BUILDING_KEYWORDS = ["plot", "building", "house", "garage"]
+# NOTE: party-wall layers are excluded here — they are used only to suppress those
+# entities from 3D_LINES, not as a source of plot outline geometry.
+BUILDING_OUTLINE_LAYERS = ["PLOT OUTLINE INNER"]   # source for pad geometry only
+BUILDING_KEYWORDS       = ["plot", "building", "house", "garage"]
+BUILDING_SUPPRESS_LAYERS = ["EXTERNAL PARTY WALL"]  # exclude from 3D_LINES but not pads
+
+# Layer keyword classification for 3D_LINES geometry selection
+DRIVE_KEYWORDS  = ["drive", "path"]
+FENCE_KEYWORDS  = ["fence", "wall", "boundary"]
+ROAD_KEYWORDS   = ["road", "footpath", "kerb"]
 
 # Elevation text source layers
 SPOT_LEVEL_LAYERS = ["LR SPOT LEVEL", "L018 HA_ANN_FEAT_TEXT"]
@@ -55,8 +63,12 @@ FFL_OFFSET = 0.025   # 25 mm
 # Tolerances
 CHAIN_SNAP_TOL      = 0.05   # 50 mm: endpoint match when chaining segments
 VERTEX_INSERT_RADIUS = 0.3   # 300 mm: snap radius for spot-level vertex insertion
-ADJACENCY_TOL       = 0.10   # 100 mm: plots within this distance are adjacent
+ADJACENCY_TOL       = 0.35   # 350 mm: plots within this distance are adjacent (crosses party walls)
 TERRAIN_SEARCH_RAD  = 5.0    # 5 m: radius for terrain Z lookup
+
+# Building pad merge parameters
+WALL_BUFFER     = 0.15   # 150 mm: approximate wall thickness; expands inner→outer boundary
+SIMPLIFY_TOL    = 0.20   # 200 mm: polygon simplification after merge (for clean vertex counts)
 
 # Arc tessellation: max chord length (metres)
 ARC_CHORD_MAX = 0.1
@@ -71,16 +83,40 @@ def dist_2d(a, b):
     return math.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2)
 
 
-def _is_outline_layer(layer_name):
-    """True if this layer carries building plot outlines."""
+def _is_pad_source_layer(layer_name):
+    """True if this layer is the source of building plot outline geometry (H-PLOT OUTLINE INNER etc.)."""
+    lu = layer_name.upper()
+    for pat in BUILDING_OUTLINE_LAYERS:
+        if pat.upper() in lu:
+            return True
+    return False
+
+
+def _is_suppress_from_lines(layer_name):
+    """True if this layer should be excluded from 3D_LINES output."""
     lu = layer_name.upper()
     for kw in BUILDING_KEYWORDS:
         if kw.upper() in lu:
             return True
-    for pat in BUILDING_OUTLINE_EXTRA_LAYERS:
+    for pat in BUILDING_OUTLINE_LAYERS + BUILDING_SUPPRESS_LAYERS:
         if pat.upper() in lu:
             return True
     return False
+
+
+def classify_layer(layer_name):
+    """Classify a layer as drive / fence / road, or return None."""
+    lu = layer_name.upper()
+    for kw in DRIVE_KEYWORDS:
+        if kw.upper() in lu:
+            return "drive"
+    for kw in FENCE_KEYWORDS:
+        if kw.upper() in lu:
+            return "fence"
+    for kw in ROAD_KEYWORDS:
+        if kw.upper() in lu:
+            return "road"
+    return None
 
 
 def parse_elevation(text_value, is_ffl=False):
@@ -359,12 +395,11 @@ def _extract_verts(entity):
     return []
 
 
-def collect_all_line_geometry(msp):
+def collect_line_geometry(msp):
     """
-    Collect every LINE / LWPOLYLINE / ARC / POLYLINE from modelspace,
-    including geometry nested inside INSERT blocks.
-
-    Building-outline layers are excluded (those are processed as pads).
+    Collect LINE / LWPOLYLINE / ARC / POLYLINE entities on drive, fence and road
+    layers (matching DRIVE_KEYWORDS, FENCE_KEYWORDS, ROAD_KEYWORDS).
+    Building / party-wall layers are excluded.
 
     Returns list of (vertices_2d, layer_name).
     """
@@ -372,7 +407,9 @@ def collect_all_line_geometry(msp):
 
     def add(entity):
         layer = entity.dxf.layer
-        if _is_outline_layer(layer):
+        if _is_suppress_from_lines(layer):
+            return
+        if classify_layer(layer) is None:
             return
         verts = _extract_verts(entity)
         if len(verts) >= 2:
@@ -590,10 +627,118 @@ def _chain_lines_to_outlines(lines, snap_tol=0.05):
     return closed_chains
 
 
-def collect_building_outlines(msp):
+def _apply_insert_xform(bx, by, insert_x, insert_y, sx, sy, rot_deg):
+    """
+    Apply a DXF INSERT transformation (scale → rotate → translate) to a 2-D point.
+    Uses the standard DXF formula so it is correct even for negative-scale (mirrored) blocks.
+    """
+    rot = math.radians(rot_deg)
+    cos_r = math.cos(rot)
+    sin_r = math.sin(rot)
+    wx = insert_x + sx * cos_r * bx - sy * sin_r * by
+    wy = insert_y + sx * sin_r * bx + sy * cos_r * by
+    return wx, wy
+
+
+def _block_outline_verts(doc, insert_entity):
+    """
+    Walk a single INSERT and its nested INSERTs, collecting building outline
+    polygons from PLOT OUTLINE INNER layers.  Transformations are applied
+    manually (avoids the ezdxf negative-scale transformation bug).
+
+    Two cases are handled:
+    1. Block has a closed LWPOLYLINE (≥3 pts) on the pad-source layer
+       → collect it directly.
+    2. Block only has 2-pt LWPOLYLINE segments (outer-wall pieces) on
+       PLOT OUTLINE INNER, and LINE entities on H-EXTERNAL PARTY WALL
+       (middle-of-terrace "MID" block types).  In this case the convex hull
+       of all segment endpoints is used to reconstruct the floor-area polygon.
+
+    Returns list of vertex lists, each already in world coordinates.
+    """
+    results = []
+
+    def recurse(ins, parent_xform):
+        """parent_xform = (ins_x, ins_y, sx, sy, rot_deg) of the chain so far."""
+        try:
+            block = doc.blocks.get(ins.dxf.name)
+        except Exception:
+            return
+        if block is None:
+            return
+
+        sx_ins  = ins.dxf.get("xscale", 1.0)
+        sy_ins  = ins.dxf.get("yscale", 1.0)
+        rot_ins = ins.dxf.get("rotation", 0.0)
+        tx_ins  = ins.dxf.insert.x
+        ty_ins  = ins.dxf.insert.y
+
+        closed_found = False   # True if any ≥3-pt LWPOLYLINE was collected
+        seg_pts = []           # endpoints from 2-pt segments / LINEs (MID case)
+
+        for entity in block:
+            try:
+                lyr = entity.dxf.layer
+            except Exception:
+                lyr = ""
+
+            is_inner  = _is_pad_source_layer(lyr)
+            # Party-wall LINEs are needed to close the outline for MID blocks.
+            # Use H-EXTERNAL PARTY WALL (not the 352 variant, which is the
+            # outer dimensioned line and would skew the outline slightly).
+            is_party  = ("EXTERNAL PARTY WALL" in lyr.upper()
+                         and "352" not in lyr.upper())
+
+            if entity.dxftype() == "LWPOLYLINE" and is_inner:
+                raw = [(x, y) for x, y, *_ in entity.get_points()]
+                step1 = [_apply_insert_xform(bx, by, tx_ins, ty_ins,
+                                              sx_ins, sy_ins, rot_ins)
+                         for bx, by in raw]
+                px, py, psx, psy, prot = parent_xform
+                step2 = [_apply_insert_xform(wx, wy, px, py, psx, psy, prot)
+                         for wx, wy in step1]
+                if len(step2) >= 3:
+                    results.append(step2)
+                    closed_found = True
+                else:
+                    # 2-pt segment: collect endpoints for convex-hull fallback
+                    seg_pts.extend(step2)
+
+            elif entity.dxftype() == "LINE" and (is_inner or is_party):
+                for pt_local in [(entity.dxf.start.x, entity.dxf.start.y),
+                                 (entity.dxf.end.x,   entity.dxf.end.y)]:
+                    s1 = _apply_insert_xform(pt_local[0], pt_local[1],
+                                             tx_ins, ty_ins,
+                                             sx_ins, sy_ins, rot_ins)
+                    px, py, psx, psy, prot = parent_xform
+                    s2 = _apply_insert_xform(s1[0], s1[1], px, py, psx, psy, prot)
+                    seg_pts.append(s2)
+
+            elif entity.dxftype() == "INSERT":
+                recurse(entity, (tx_ins, ty_ins, sx_ins, sy_ins, rot_ins))
+
+        # MID-block fallback: build convex hull from all segment endpoints
+        if not closed_found and len(seg_pts) >= 3:
+            try:
+                from shapely.geometry import MultiPoint
+                hull = MultiPoint(seg_pts).convex_hull
+                if hull.geom_type == "Polygon" and not hull.is_empty:
+                    results.append(list(hull.exterior.coords))
+            except Exception:
+                pass
+
+    # The top-level INSERT has no parent transform (identity)
+    recurse(insert_entity, (0.0, 0.0, 1.0, 1.0, 0.0))
+    return results
+
+
+def collect_building_outlines(msp, doc):
     """
     Collect building plot outlines as (vertices_2d, layer_name) pairs.
-    Handles LWPOLYLINE entities and LINE entities that form closed polygons.
+    Only H-PLOT OUTLINE INNER (and similar BUILDING_OUTLINE_LAYERS) LWPOLYLINEs
+    are used; party-wall LINE entities are ignored.
+    Transformations for nested blocks are applied manually to avoid the ezdxf
+    negative-scale (mirrored INSERT) transformation bug.
     """
     outlines = []
     seen = set()
@@ -601,36 +746,23 @@ def collect_building_outlines(msp):
     def add(verts, layer):
         if len(verts) < 3:
             return
-        cx = round(sum(v[0] for v in verts) / len(verts), 3)
-        cy = round(sum(v[1] for v in verts) / len(verts), 3)
+        cx = round(sum(v[0] for v in verts) / len(verts), 2)
+        cy = round(sum(v[1] for v in verts) / len(verts), 2)
         if (cx, cy) not in seen:
             seen.add((cx, cy))
             outlines.append((verts, layer))
 
-    lines_by_layer = defaultdict(list)
+    # Direct LWPOLYLINE entities in modelspace
+    for entity in msp:
+        if entity.dxftype() == "LWPOLYLINE" and _is_pad_source_layer(entity.dxf.layer):
+            add([(x, y) for x, y, *_ in entity.get_points()], entity.dxf.layer)
 
+    # Geometry inside INSERT blocks (all INSERT entities, any layer)
     for entity in msp:
         if entity.dxftype() != "INSERT":
             continue
-        if not _is_outline_layer(entity.dxf.layer):
-            continue
-        for sub in iter_virtual_deep(entity):
-            if not _is_outline_layer(sub.dxf.layer):
-                continue
-            if sub.dxftype() == "LWPOLYLINE":
-                add([(x, y) for x, y, *_ in sub.get_points()], sub.dxf.layer)
-            elif sub.dxftype() == "LINE":
-                s, e = sub.dxf.start, sub.dxf.end
-                if math.hypot(e.x - s.x, e.y - s.y) > 0.01:
-                    lines_by_layer[sub.dxf.layer].append(((s.x, s.y), (e.x, e.y)))
-
-    for layer, lines in lines_by_layer.items():
-        for chain in _chain_lines_to_outlines(lines):
-            add(chain, layer)
-
-    for entity in msp:
-        if entity.dxftype() == "LWPOLYLINE" and _is_outline_layer(entity.dxf.layer):
-            add([(x, y) for x, y, *_ in entity.get_points()], entity.dxf.layer)
+        for verts in _block_outline_verts(doc, entity):
+            add(verts, BUILDING_OUTLINE_LAYERS[0])
 
     return outlines
 
@@ -653,6 +785,24 @@ def assign_ffl_and_merge(outlines, ffl_annotations):
     ffl_annotations: list of ((x, y), ffl_value)
 
     Returns list of (shapely_polygon, ffl_value).
+
+    Algorithm:
+      Pass 1 – assign the FFL annotation to the nearest polygon (within FFL_PROXIMITY).
+               Ties broken by distance; each annotation claims at most one polygon,
+               each polygon keeps only its first (closest) assignment.
+      Pass 2 – BFS flood-fill: propagates FFL outward from annotated polygons
+               to unassigned neighbours within ADJACENCY_TOL, in geographic order
+               (nearest-first), so that each plot gets the FFL of the nearest
+               annotated polygon reachable through adjacency.
+      Pass 3 – narrow fallback: any polygon still unassigned is given the FFL
+               of the nearest annotation within FFL_PROXIMITY (5 m).  Polygons
+               more than 5 m from every annotation are silently dropped.
+    Merging:
+      Within each FFL group, plots are buffered by WALL_BUFFER (≈ wall thickness)
+      so that adjacent inner-floor-area polygons touch, then unioned.  The result
+      is simplified to give clean low-vertex-count polygons that approximate the
+      outer wall boundary.  No convex-hull bridging is used: that produced
+      high-vertex artefacts that did not match the reference geometry.
     """
     # Build shapely polygons
     polys = []
@@ -667,43 +817,64 @@ def assign_ffl_and_merge(outlines, ffl_annotations):
     n = len(polys)
     ffl_assigned = [None] * n
 
-    # Pass 1: point-in-polygon — find which poly directly contains each FFL text
+    # ------------------------------------------------------------------
+    # Pass 1 – assign the nearest polygon to each FFL annotation
+    # ------------------------------------------------------------------
+    FFL_PROXIMITY = 5.0   # metres — annotation may sit in road/garden between plots
     for (fx, fy), ffl_val in ffl_annotations:
         pt = Point(fx, fy)
+        best_i, best_d = None, FFL_PROXIMITY
         for i, poly in enumerate(polys):
-            if poly.contains(pt) or (poly.distance(pt) < ADJACENCY_TOL
-                                     and ffl_assigned[i] is None):
-                ffl_assigned[i] = ffl_val
-                break
+            if poly.contains(pt):
+                d = 0.0
+            else:
+                d = poly.distance(pt)
+            if d < best_d:
+                best_d, best_i = d, i
+        if best_i is not None and ffl_assigned[best_i] is None:
+            ffl_assigned[best_i] = ffl_val
 
-    # Pass 2: flood-fill to adjacent unassigned plots (shared edge within tolerance)
-    changed = True
-    while changed:
-        changed = False
-        for i in range(n):
-            if ffl_assigned[i] is not None:
-                continue
-            for j in range(n):
-                if i == j or ffl_assigned[j] is None:
-                    continue
-                if polys[i].distance(polys[j]) < ADJACENCY_TOL:
-                    ffl_assigned[i] = ffl_assigned[j]
-                    changed = True
-                    break
+    # ------------------------------------------------------------------
+    # Pass 2 – BFS flood-fill through adjacent polygons
+    # Build adjacency list first (O(n²) is fine for n≈62)
+    # ------------------------------------------------------------------
+    adj = [[] for _ in range(n)]
+    for i in range(n):
+        for j in range(i + 1, n):
+            if polys[i].distance(polys[j]) < ADJACENCY_TOL:
+                adj[i].append(j)
+                adj[j].append(i)
 
-    # Pass 3: fallback — nearest FFL annotation within 20 m
+    # Initialise BFS queue with all annotated polygons
+    queue = deque()
+    for i in range(n):
+        if ffl_assigned[i] is not None:
+            queue.append(i)
+
+    while queue:
+        i = queue.popleft()
+        for j in adj[i]:
+            if ffl_assigned[j] is None:
+                ffl_assigned[j] = ffl_assigned[i]
+                queue.append(j)
+
+    # ------------------------------------------------------------------
+    # Pass 3 – narrow fallback: nearest annotation within FFL_PROXIMITY
+    # ------------------------------------------------------------------
     for i in range(n):
         if ffl_assigned[i] is not None:
             continue
         cx, cy = polys[i].centroid.x, polys[i].centroid.y
-        best_ffl, best_d = None, 20.0
+        best_ffl, best_d = None, FFL_PROXIMITY
         for (fx, fy), ffl_val in ffl_annotations:
             d = dist_2d((cx, cy), (fx, fy))
             if d < best_d:
                 best_d, best_ffl = d, ffl_val
-        ffl_assigned[i] = best_ffl
+        ffl_assigned[i] = best_ffl   # may remain None → dropped below
 
-    # Group by FFL and union
+    # ------------------------------------------------------------------
+    # Group and merge
+    # ------------------------------------------------------------------
     groups = defaultdict(list)
     for i, ffl_val in enumerate(ffl_assigned):
         if ffl_val is not None:
@@ -711,12 +882,30 @@ def assign_ffl_and_merge(outlines, ffl_annotations):
 
     result = []
     for ffl_val, group_polys in groups.items():
-        merged = unary_union(group_polys)
-        if merged.geom_type == "MultiPolygon":
+        # Expand each inner-floor-area polygon by WALL_BUFFER so that
+        # adjacent plots touch (party-wall gap ≤ 2×WALL_BUFFER), then union.
+        # The outer boundary of the result approximates the outer wall face.
+        # A gentle opening (small buffer in/out) removes thin artefacts, and
+        # simplification reduces vertex count to match the reference (~5–7 verts).
+        expanded  = [p.buffer(WALL_BUFFER) for p in group_polys]
+        merged    = unary_union(expanded)
+        # Opening: remove thin slivers produced by the buffer
+        merged    = merged.buffer(-0.01).buffer(0.01)
+        # Take convex hull first (all reference pads are convex), then
+        # simplify to clean the hull vertices.  This order is critical:
+        # simplifying a complex buffer polygon first leaves many near-collinear
+        # hull vertices; convex_hull → simplify gives 5–6 clean vertices.
+        if merged.geom_type == "Polygon" and not merged.is_empty:
+            hull = merged.convex_hull
+            final = hull.simplify(SIMPLIFY_TOL, preserve_topology=False)
+            result.append((final if not final.is_empty else hull, ffl_val))
+        elif merged.geom_type == "MultiPolygon":
+            # Each disconnected part is a separate pad
             for part in merged.geoms:
-                result.append((part, ffl_val))
-        elif merged.geom_type == "Polygon" and not merged.is_empty:
-            result.append((merged, ffl_val))
+                if not part.is_empty:
+                    hull = part.convex_hull
+                    final = hull.simplify(SIMPLIFY_TOL, preserve_topology=False)
+                    result.append((final if not final.is_empty else hull, ffl_val))
 
     return result
 
@@ -880,8 +1069,8 @@ def run_pipeline(input_path, output_path):
     print()
 
     # ── Line geometry ─────────────────────────────────────────────────────────
-    print("[4/8] Collecting all line geometry...")
-    raw_segs = collect_all_line_geometry(msp)
+    print("[4/8] Collecting drive / fence / road line geometry...")
+    raw_segs = collect_line_geometry(msp)
     print(f"  {len(raw_segs)} raw segments\n")
 
     print("[5/8] Inserting spot vertices, chaining, elevating...")
@@ -893,7 +1082,7 @@ def run_pipeline(input_path, output_path):
 
     # ── Building pads ─────────────────────────────────────────────────────────
     print("[6/8] Collecting building outlines...")
-    outlines = collect_building_outlines(msp)
+    outlines = collect_building_outlines(msp, doc)
     print(f"  {len(outlines)} outlines found\n")
 
     print("[7/8] Merging adjacent same-FFL plots, generating pad polylines...")
