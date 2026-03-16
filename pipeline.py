@@ -67,7 +67,7 @@ ADJACENCY_TOL       = 0.35   # 350 mm: plots within this distance are adjacent (
 TERRAIN_SEARCH_RAD  = 5.0    # 5 m: radius for terrain Z lookup
 
 # Building pad merge parameters
-WALL_BUFFER     = 0.15   # 150 mm: approximate wall thickness; expands inner→outer boundary
+WALL_BUFFER     = 0.205  # 205 mm: wall thickness buffer; expands inner→outer boundary
 SIMPLIFY_TOL    = 0.20   # 200 mm: polygon simplification after merge (for clean vertex counts)
 
 # Arc tessellation: max chord length (metres)
@@ -882,30 +882,23 @@ def assign_ffl_and_merge(outlines, ffl_annotations):
 
     result = []
     for ffl_val, group_polys in groups.items():
-        # Expand each inner-floor-area polygon by WALL_BUFFER so that
-        # adjacent plots touch (party-wall gap ≤ 2×WALL_BUFFER), then union.
-        # The outer boundary of the result approximates the outer wall face.
-        # A gentle opening (small buffer in/out) removes thin artefacts, and
-        # simplification reduces vertex count to match the reference (~5–7 verts).
-        expanded  = [p.buffer(WALL_BUFFER) for p in group_polys]
+        # Apply convex_hull to each individual inner polygon first so that
+        # duplicate/near-duplicate polygons (e.g. two coincident LWPOLYLINEs
+        # in the same block) don't produce complex buffer shapes.
+        # Then expand by WALL_BUFFER to approximate the outer wall face and
+        # union adjacent plots.  No global convex_hull is applied to the merged
+        # result so that non-convex (e.g. L-shaped) terrace footprints are
+        # preserved.  A gentle opening removes thin artefacts; simplification
+        # reduces vertex count to match the reference (~4–7 verts).
+        expanded  = [p.convex_hull.buffer(WALL_BUFFER) for p in group_polys]
         merged    = unary_union(expanded)
         # Opening: remove thin slivers produced by the buffer
         merged    = merged.buffer(-0.01).buffer(0.01)
-        # Take convex hull first (all reference pads are convex), then
-        # simplify to clean the hull vertices.  This order is critical:
-        # simplifying a complex buffer polygon first leaves many near-collinear
-        # hull vertices; convex_hull → simplify gives 5–6 clean vertices.
-        if merged.geom_type == "Polygon" and not merged.is_empty:
-            hull = merged.convex_hull
-            final = hull.simplify(SIMPLIFY_TOL, preserve_topology=False)
-            result.append((final if not final.is_empty else hull, ffl_val))
-        elif merged.geom_type == "MultiPolygon":
-            # Each disconnected part is a separate pad
-            for part in merged.geoms:
-                if not part.is_empty:
-                    hull = part.convex_hull
-                    final = hull.simplify(SIMPLIFY_TOL, preserve_topology=False)
-                    result.append((final if not final.is_empty else hull, ffl_val))
+        parts = list(merged.geoms) if merged.geom_type == "MultiPolygon" else [merged]
+        for part in parts:
+            if not part.is_empty:
+                final = part.simplify(SIMPLIFY_TOL, preserve_topology=False)
+                result.append((final if not final.is_empty else part, ffl_val))
 
     return result
 
@@ -941,6 +934,13 @@ def generate_pad_polylines(merged_pads, terrain_pts):
                 inner = poly   # degenerate — use original
         except Exception:
             inner = poly
+
+        # Re-simplify after the inset buffer to remove spurious vertices that
+        # the inward buffer can introduce on concave boundaries.
+        if inner.geom_type == "Polygon":
+            inner2 = inner.simplify(0.10, preserve_topology=False)
+            if not inner2.is_empty:
+                inner = inner2
 
         if inner.geom_type == "MultiPolygon":
             inner_parts = list(inner.geoms)
