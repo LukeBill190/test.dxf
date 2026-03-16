@@ -558,14 +558,77 @@ def chain_segments(segments, snap_tol=CHAIN_SNAP_TOL):
     return result
 
 
+def assign_z_spot_owned(verts_2d, terrain_pts, search_radius=TERRAIN_SEARCH_RAD):
+    """
+    Elevation model for open polylines (drives, fences, roads).
+
+    Each terrain point 'owns' the single nearest vertex within search_radius.
+    Ownership is assigned greedily (shortest terrain→vertex distance first), so
+    each vertex receives the Z of its closest terrain point and each terrain point
+    influences exactly one vertex — matching the survey convention where a spot
+    level controls only the one polyline node closest to it.
+
+    Intermediate vertices between owned vertices receive Z by linear interpolation
+    along cumulative polyline length.  End vertices with no outward owned neighbour
+    fall back to the nearest known Z in the polyline; any still-unknown vertex
+    defaults to 0.0.
+    """
+    n = len(verts_2d)
+    if n == 0:
+        return []
+
+    z_assigned = [None] * n
+
+    # Build (dist, terrain_z, vertex_index) — each terrain point → its nearest vertex
+    candidates = []
+    for tx, ty, tz in terrain_pts:
+        best_i, best_d = None, search_radius
+        for i, (vx, vy) in enumerate(verts_2d):
+            d = math.sqrt((tx - vx) ** 2 + (ty - vy) ** 2)
+            if d < best_d:
+                best_d = d
+                best_i = i
+        if best_i is not None:
+            candidates.append((best_d, tz, best_i))
+
+    # Greedy assignment: shortest distance first; each vertex claimed at most once
+    candidates.sort()
+    for _d, tz, i in candidates:
+        if z_assigned[i] is None:
+            z_assigned[i] = tz
+
+    pts = [(verts_2d[i][0], verts_2d[i][1], z_assigned[i]) for i in range(n)]
+
+    # Linear interpolation along polyline for unassigned interior vertices
+    for i in range(n):
+        if pts[i][2] is None:
+            z = interpolate_z_along(pts, i)
+            if z is not None:
+                pts[i] = (pts[i][0], pts[i][1], z)
+
+    # Nearest-Z fallback for remaining gaps (typically end vertices beyond terrain coverage)
+    for i in range(n):
+        if pts[i][2] is None:
+            best_z, best_d = None, 1e99
+            for j, (ox, oy, oz) in enumerate(pts):
+                if oz is not None and j != i:
+                    d = math.sqrt((pts[i][0] - ox) ** 2 + (pts[i][1] - oy) ** 2)
+                    if d < best_d:
+                        best_d, best_z = d, oz
+            if best_z is not None:
+                pts[i] = (pts[i][0], pts[i][1], best_z)
+
+    return [(x, y, z if z is not None else 0.0) for x, y, z in pts]
+
+
 def elevate_line_geometry(segments, terrain_pts):
     """
-    Assign Z to every vertex in every segment from the terrain model.
+    Assign Z to every vertex in every segment using the spot-owned model.
     Returns list of ([(x,y,z), ...], layer_name).
     """
     result = []
     for verts_2d, layer in segments:
-        verts_3d = assign_z_to_vertices(verts_2d, terrain_pts, TERRAIN_SEARCH_RAD)
+        verts_3d = assign_z_spot_owned(verts_2d, terrain_pts)
         if len(verts_3d) >= 2:
             result.append((verts_3d, layer))
     return result
