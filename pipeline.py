@@ -818,6 +818,14 @@ def _block_outline_verts(doc, insert_entity):
         outer_line_segs = []   # ((x1,y1),(x2,y2)) from H-EXTERNAL WALL LINE
         party352_segs   = []   # ((x1,y1),(x2,y2)) from H-EXTERNAL PARTY WALL 352
 
+        # Collect LWPOLYLINEs separately by type for deduplication within this scope.
+        scope_outer_wall_lwpolys = []  # from H-EXTERNAL WALL layer
+        scope_party352_lwpolys   = []  # from H-EXTERNAL PARTY WALL 352 layer
+
+        # Tracks whether THIS block's LWPOLY entities (not nested INSERT recursion)
+        # contributed outer polys.  Used to decide whether LINE chaining is needed.
+        outer_added_by_lwpoly = False
+
         def world_pt(lx, ly):
             """Transform a block-local point to world coordinates."""
             s1 = _apply_insert_xform(lx, ly, tx_ins, ty_ins, sx_ins, sy_ins, rot_ins)
@@ -842,12 +850,13 @@ def _block_outline_verts(doc, insert_entity):
                 step2 = [world_pt(bx, by) for bx, by in raw]
 
                 if is_outer and len(step2) >= 3:
-                    outer_results.append(step2)
+                    scope_outer_wall_lwpolys.append(step2)
 
-                elif is_party352 and len(step2) >= 2:
-                    # Party wall 352 as polyline: treat as segment sequence
-                    for k in range(len(step2) - 1):
-                        party352_segs.append((step2[k], step2[k + 1]))
+                elif is_party352 and len(step2) >= 3:
+                    # Collected separately; priority decision made after entity loop.
+                    scope_party352_lwpolys.append(step2)
+                elif is_party352 and len(step2) == 2:
+                    party352_segs.append((step2[0], step2[1]))
 
                 elif is_inner:
                     if len(step2) >= 3:
@@ -870,23 +879,71 @@ def _block_outline_verts(doc, insert_entity):
             elif entity.dxftype() == "INSERT":
                 recurse(entity, (tx_ins, ty_ins, sx_ins, sy_ins, rot_ins))
 
+        # Add all H-EXTERNAL WALL LWPOLYLINEs unconditionally.
+        for poly in scope_outer_wall_lwpolys:
+            outer_results.append(poly)
+            outer_added_by_lwpoly = True
+
+        # Add party352 LWPOLYLINEs, deduplicating nearly-identical ones within this scope.
+        deduped_p352 = []
+        for verts in scope_party352_lwpolys:
+            try:
+                p_new = Polygon(verts)
+                if not p_new.is_valid:
+                    p_new = p_new.buffer(0)
+                is_dup = False
+                for p_kept in deduped_p352:
+                    inter = p_new.intersection(p_kept).area
+                    union = p_new.union(p_kept).area
+                    if union > 0 and inter / union > 0.95:
+                        is_dup = True
+                        break
+                if not is_dup:
+                    deduped_p352.append(p_new)
+                    outer_results.append(verts)
+                    outer_added_by_lwpoly = True
+            except Exception:
+                outer_results.append(verts)
+                outer_added_by_lwpoly = True
+
         # --- Try to chain H-EXTERNAL WALL LINE + H-EXTERNAL PARTY WALL 352 segments ---
         # This reconstructs the outer boundary for house blocks where H-EXTERNAL WALL
         # is expressed as LINE entities rather than a single closed LWPOLYLINE.
-        if outer_line_segs and not any(
-            OUTER_WALL_LAYER.upper() in lyr.upper()
-            for ent in block
-            for lyr in [ent.dxf.get("layer", "") if hasattr(ent, "dxf") else ""]
-            if ent.dxftype() == "LWPOLYLINE" and len(list(ent.get_points())) >= 3
-        ):
+        if outer_line_segs and not outer_added_by_lwpoly:
             all_outer_segs = outer_line_segs + party352_segs
             try:
                 closed_outer = _chain_lines_to_outlines(all_outer_segs, snap_tol=0.05)
                 for chain in closed_outer:
                     if len(chain) >= 3:
+                        # Reject degenerate chains with near-zero area
+                        # (e.g. two collinear segments sharing endpoints chain into a line)
+                        try:
+                            _cp = Polygon(chain)
+                            if _cp.area < 0.5:  # < 0.5 m² is degenerate for building pads
+                                continue
+                        except Exception:
+                            pass
                         outer_results.append(chain)
+                        outer_added_by_lwpoly = True
             except Exception:
                 pass
+
+        # --- Convex hull of party352 LINE endpoints as outer polygon fallback ---
+        # Works for KIRK (3-sided incomplete LINE chain) and ALDRIDGE-MID (top+bottom LINEs).
+        # The 4 corner points of the outer wall rectangle are all present as LINE endpoints.
+        if not outer_added_by_lwpoly and party352_segs:
+            party_pts = set()
+            for (ax, ay), (bx, by) in party352_segs:
+                party_pts.add((round(ax, 3), round(ay, 3)))
+                party_pts.add((round(bx, 3), round(by, 3)))
+            if len(party_pts) >= 4:
+                try:
+                    from shapely.geometry import MultiPoint
+                    hull = MultiPoint(list(party_pts)).convex_hull
+                    if hull.geom_type == "Polygon" and not hull.is_empty:
+                        outer_results.append(list(hull.exterior.coords))
+                except Exception:
+                    pass
 
         # --- Inner polygon fallback: convex hull from segment endpoints (MID blocks) ---
         if not closed_found and len(seg_pts) >= 3:
@@ -900,6 +957,7 @@ def _block_outline_verts(doc, insert_entity):
 
     # The top-level INSERT has no parent transform (identity)
     recurse(insert_entity, (0.0, 0.0, 1.0, 1.0, 0.0))
+
     return inner_results, outer_results
 
 
@@ -1115,7 +1173,14 @@ def assign_ffl_and_merge(inner_outlines, ffl_annotations, outer_outlines=None):
         for poly in inner_in_group:
             expanded.append(poly.convex_hull.buffer(WALL_BUFFER))
 
-        merged = unary_union(expanded)
+        # Close floating-point gaps (< 10 mm) between adjacent outer polys that
+        # result from coordinate transform precision in nested INSERT blocks.
+        # buffer(+d) + unary_union + buffer(-d) is a no-op for convex corners
+        # (mitre join_style=2) but bridges tiny precision gaps so adjacent
+        # terrace units merge into a single polygon.
+        GAP_CLOSE = 0.0001  # 0.1 mm (actual float gaps are ≤ 0.03 mm)
+        expanded_padded = [poly.buffer(GAP_CLOSE, join_style=2) for poly in expanded]
+        merged = unary_union(expanded_padded).buffer(-GAP_CLOSE, join_style=2)
 
         has_inner_only = bool(inner_in_group) and not outer_in_group
         if has_inner_only:
