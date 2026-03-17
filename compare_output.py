@@ -19,15 +19,23 @@ def get_polylines(doc, layer):
     for ent in doc.modelspace():
         if ent.dxf.layer != layer:
             continue
-        if ent.dxftype() == "POLYLINE":
-            verts = [(v.dxf.location.x, v.dxf.location.y, v.dxf.location.z)
-                     for v in ent.vertices]
-        elif ent.dxftype() == "LWPOLYLINE":
+        dtype = ent.dxftype()
+        if dtype == "POLYLINE":
+            # 3D polyline (add_polyline3d) or 2D polyline
+            try:
+                verts = [(v.dxf.location.x, v.dxf.location.y, v.dxf.location.z)
+                         for v in ent.vertices]
+            except Exception:
+                verts = []
+        elif dtype == "LWPOLYLINE":
             elev = ent.dxf.get("elevation", 0.0)
             try:
                 verts = [(x, y, z or elev) for x, y, z, *_ in ent.get_points(format="xyzb")]
             except Exception:
                 verts = [(x, y, elev) for x, y in ent.get_points()]
+        elif dtype == "LINE":
+            s = ent.dxf.start; e = ent.dxf.end
+            verts = [(s.x, s.y, s.z), (e.x, e.y, e.z)]
         else:
             continue
         if verts:
