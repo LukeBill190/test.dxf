@@ -96,6 +96,13 @@ ARC_CHORD_MAX = 0.1
 # matches the reference model (which has vertices ~ every 1 m along polylines).
 MAX_VERTEX_SPACING = 1.0
 
+# ML elevation model (loaded at runtime if elevation_model.pkl exists)
+try:
+    import ml_elevation as _ml_elevation
+    _HAS_ML = True
+except ImportError:
+    _HAS_ML = False
+
 
 # ---------------------------------------------------------------------------
 # Utility helpers
@@ -113,6 +120,15 @@ def _is_pad_source_layer(layer_name):
         if pat.upper() in lu:
             return True
     return False
+
+
+def _classify_layer_ml(layer_name):
+    """Return 'fence', 'drive', 'road', or None for ML feature extraction."""
+    ll = layer_name.lower()
+    if any(kw in ll for kw in FENCE_KEYWORDS): return "fence"
+    if any(kw in ll for kw in DRIVE_KEYWORDS): return "drive"
+    if any(kw in ll for kw in ROAD_KEYWORDS):  return "road"
+    return None
 
 
 def _is_suppress_from_lines(layer_name):
@@ -681,12 +697,17 @@ def subdivide_segments_3d(polys_3d, max_spacing=MAX_VERTEX_SPACING):
 
 
 def assign_z_spot_owned(verts_2d, terrain_pts, search_radius=TERRAIN_SEARCH_RAD,
-                        tin=None, shared_assignment=False):
+                        tin=None, shared_assignment=False, z_precomputed=None):
     """
     Elevation model for open polylines (drives, fences, roads).
 
     Phase 1 – Spot-owned assignment:
-      Two modes controlled by shared_assignment:
+      Three modes:
+
+      z_precomputed is not None:
+        Use pre-computed Z values (e.g. from ML model) as Phase 1 seeds.
+        Only vertices with a non-None value in z_precomputed are assigned;
+        the rest fall through to Phase 2/3/4 as normal.
 
       shared_assignment=False  (default, used for drives/roads):
         Terrain-centric greedy — each terrain point claims the single nearest
@@ -719,7 +740,12 @@ def assign_z_spot_owned(verts_2d, terrain_pts, search_radius=TERRAIN_SEARCH_RAD,
     z_assigned = [None] * n
 
     # ── Phase 1: spot-owned assignment ────────────────────────────────────────
-    if shared_assignment:
+    if z_precomputed is not None:
+        # Use pre-computed Z (ML predictions) for vertices that have one.
+        for i, z in enumerate(z_precomputed):
+            if z is not None:
+                z_assigned[i] = z
+    elif shared_assignment:
         # Vertex-centric: each vertex independently finds its nearest terrain pt.
         for i, (vx, vy) in enumerate(verts_2d):
             best_d, best_z = search_radius, None
@@ -780,16 +806,58 @@ def assign_z_spot_owned(verts_2d, terrain_pts, search_radius=TERRAIN_SEARCH_RAD,
 
 def elevate_line_geometry(segments, terrain_pts, tin=None,
                           search_radius=TERRAIN_SEARCH_RAD,
-                          shared_assignment=False):
+                          shared_assignment=False,
+                          ml_payload=None, ann_by_type=None,
+                          bldg_verts_ml=None, site_median_z=None):
     """
-    Assign Z to every vertex in every segment using the spot-owned model.
+    Assign Z to every vertex in every segment.
+
+    When ml_payload is provided (loaded via ml_elevation.load_model()), the ML
+    model replaces Phase-1 (greedy spot-owned assignment) for vertices that are
+    within search_radius of at least one terrain annotation.  Vertices further
+    away (dense intermediate subdivision vertices) still go through Phases 2–4
+    (linear interpolation, TIN, nearest-Z), exactly as in the algorithmic path.
+    This hybrid ensures the ML improves Z accuracy at terrain-annotated vertices
+    while linear interpolation fills in the gaps correctly.
+
     Returns list of ([(x,y,z), ...], layer_name).
     """
+    use_ml = (ml_payload is not None and ann_by_type is not None and _HAS_ML)
     result = []
     for verts_2d, layer in segments:
-        verts_3d = assign_z_spot_owned(verts_2d, terrain_pts, tin=tin,
-                                       search_radius=search_radius,
-                                       shared_assignment=shared_assignment)
+        if use_ml:
+            try:
+                layer_type = _classify_layer_ml(layer)
+                # Identify vertices within terrain search radius
+                all_terrain = [pt for pts in ann_by_type.values() for pt in pts]
+                near_mask = [False] * len(verts_2d)
+                for i, (vx, vy) in enumerate(verts_2d):
+                    for tx, ty, tz, *_ in all_terrain:
+                        if math.sqrt((tx - vx) ** 2 + (ty - vy) ** 2) <= search_radius:
+                            near_mask[i] = True
+                            break
+                # ML predictions for all vertices (cheap batch call)
+                z_preds = _ml_elevation.predict_z_batch(
+                    verts_2d, layer_type, ann_by_type,
+                    bldg_verts_ml or [], site_median_z or 0.0, ml_payload
+                )
+                # Phase 1 seeds: only use ML Z for vertices near terrain
+                z_precomputed = [z_preds[i] if near_mask[i] else None
+                                 for i in range(len(verts_2d))]
+                # Phase 2/3/4 handled inside assign_z_spot_owned
+                verts_3d = assign_z_spot_owned(verts_2d, terrain_pts, tin=tin,
+                                               search_radius=search_radius,
+                                               shared_assignment=shared_assignment,
+                                               z_precomputed=z_precomputed)
+            except Exception as e:
+                print(f"  [ML fallback → algorithmic] {layer}: {e}")
+                verts_3d = assign_z_spot_owned(verts_2d, terrain_pts, tin=tin,
+                                               search_radius=search_radius,
+                                               shared_assignment=shared_assignment)
+        else:
+            verts_3d = assign_z_spot_owned(verts_2d, terrain_pts, tin=tin,
+                                           search_radius=search_radius,
+                                           shared_assignment=shared_assignment)
         if len(verts_3d) >= 2:
             result.append((verts_3d, layer))
     return result
@@ -1547,6 +1615,38 @@ def run_pipeline(input_path, output_path):
     tin = build_tin(terrain_pts)
     print(f"  TIN: {'built from ' + str(len(terrain_pts)) + ' pts' if tin is not None else 'unavailable (scipy missing)'}")
     print(f"  Terrain pts for 3D_LINES: {len(spot_terrain_pts)}")
+
+    # Try to load the trained ML elevation model.
+    _ml_payload = None
+    _ann_by_type = None
+    _bldg_verts_ml = None
+    _site_median_z = None
+    if _HAS_ML:
+        _ml_payload = _ml_elevation.load_model()
+        if _ml_payload:
+            # Build annotation dict for ML feature extraction (same format as ml_elevation)
+            _ann_by_type = {"SPOT": [], "DPC": [], "L018": [], "FFL": []}
+            for xy, elev, layer, is_ffl, is_dpc in elevation_data:
+                lu = layer.upper()
+                if "LR SPOT LEVEL" in lu:
+                    _ann_by_type["SPOT"].append((xy[0], xy[1], elev, "SPOT"))
+                elif "LR DPC LEVEL" in lu:
+                    _ann_by_type["DPC"].append((xy[0], xy[1], elev, "DPC"))
+                elif "L018 HA_ANN_FEAT_TEXT" in lu:
+                    _ann_by_type["L018"].append((xy[0], xy[1], elev, "L018"))
+                elif "LR LLFA FFL" in lu:
+                    _ann_by_type["FFL"].append((xy[0], xy[1], elev, "FFL"))
+            _bldg_verts_ml = _ml_elevation.collect_building_verts(msp)
+            all_z = [elev for _, elev, _, _, _ in elevation_data]
+            if all_z:
+                sorted_z = sorted(all_z)
+                n = len(sorted_z)
+                _site_median_z = (sorted_z[n // 2] if n % 2
+                                  else (sorted_z[n // 2 - 1] + sorted_z[n // 2]) / 2.0)
+            print(f"  ML model loaded ({_ml_payload['n_projects']} project(s), "
+                  f"{_ml_payload['total_verts']} training vertices) — using ML elevation")
+        else:
+            print("  No ML model found — using algorithmic elevation assignment")
     print()
 
     # ── Line geometry ─────────────────────────────────────────────────────────
@@ -1558,7 +1658,11 @@ def run_pipeline(input_path, output_path):
     segs = insert_spot_vertices(raw_segs, spot_terrain_pts, TERRAIN_SEARCH_RAD)
     segs = chain_segments(segs)
     segs = subdivide_segments(segs, MAX_VERTEX_SPACING)
-    line_polys_3d = elevate_line_geometry(segs, spot_terrain_pts, tin=tin)
+    line_polys_3d = elevate_line_geometry(
+        segs, spot_terrain_pts, tin=tin,
+        ml_payload=_ml_payload, ann_by_type=_ann_by_type,
+        bldg_verts_ml=_bldg_verts_ml, site_median_z=_site_median_z,
+    )
     print(f"  {len(line_polys_3d)} 3D_LINES polylines\n")
 
     # ── Building pads ─────────────────────────────────────────────────────────
