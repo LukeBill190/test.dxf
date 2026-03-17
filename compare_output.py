@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """
-DXF linework comparison: for each reference vertex, find the nearest output vertex
-in TRUE 3D distance. Report violations where no output vertex is within 10mm 3D.
+DXF linework comparison.
+
+For PLOTS FFL / PLOTS EXTERNAL LEVEL (pad layers): vertex-to-vertex 3D comparison.
+For 3D_LINES (drive/fence/road linework): each ref vertex is projected onto the
+  nearest output SEGMENT so that differences in vertex density don't cause false
+  failures.  The 3D distance from the ref vertex to its foot-point on the segment
+  must be ≤ TOLERANCE.
 
 Usage: python compare_output.py [output.dxf [reference.dxf]]
 """
@@ -66,7 +71,23 @@ def nearest_3d(qx, qy, qz, verts, grid, cell, max_d):
     return best, bi
 
 
-def compare_layer(out_polys, ref_polys):
+def pt_to_seg_3d(px, py, pz, ax, ay, az, bx, by, bz):
+    """
+    3D distance from point P to segment A–B.
+    Returns (distance, foot_x, foot_y, foot_z).
+    """
+    dx, dy, dz = bx - ax, by - ay, bz - az
+    len_sq = dx*dx + dy*dy + dz*dz
+    if len_sq < 1e-18:
+        d = math.sqrt((px-ax)**2 + (py-ay)**2 + (pz-az)**2)
+        return d, ax, ay, az
+    t = max(0.0, min(1.0, ((px-ax)*dx + (py-ay)*dy + (pz-az)*dz) / len_sq))
+    fx, fy, fz = ax + t*dx, ay + t*dy, az + t*dz
+    d = math.sqrt((px-fx)**2 + (py-fy)**2 + (pz-fz)**2)
+    return d, fx, fy, fz
+
+
+def compare_layer(out_polys, ref_polys, use_segment_projection=False):
     out_verts = [(x, y, z) for p in out_polys for x, y, z in p]
     ref_verts = [(x, y, z) for p in ref_polys for x, y, z in p]
     ref_poly_idx = [pi for pi, p in enumerate(ref_polys) for _ in p]
@@ -74,27 +95,58 @@ def compare_layer(out_polys, ref_polys):
     if not out_verts or not ref_verts:
         return out_verts, ref_verts, []
 
-    # Build 3D grid on output (we check ref → output)
+    if use_segment_projection:
+        # For linework: project each ref vertex onto nearest output segment.
+        # Build a spatial index on output segment midpoints (XY only) for candidate search.
+        segs = []  # (ax,ay,az,bx,by,bz,mid_x,mid_y)
+        for poly in out_polys:
+            for i in range(len(poly) - 1):
+                ax, ay, az = poly[i]; bx, by, bz = poly[i+1]
+                segs.append((ax, ay, az, bx, by, bz, (ax+bx)/2, (ay+by)/2))
+
+        SEARCH = 5.0  # 5 m candidate radius
+        violations = []
+        for ri, (rx, ry, rz) in enumerate(ref_verts):
+            best_d = SEARCH; best_foot = None
+            for ax, ay, az, bx, by, bz, mx, my in segs:
+                # Quick XY prefilter on segment midpoint
+                if abs(mx - rx) > SEARCH or abs(my - ry) > SEARCH:
+                    continue
+                d, fx, fy, fz = pt_to_seg_3d(rx, ry, rz, ax, ay, az, bx, by, bz)
+                if d < best_d:
+                    best_d = d; best_foot = (fx, fy, fz)
+            if best_foot is None or best_d > TOLERANCE:
+                foot = best_foot or (rx, ry, rz)
+                violations.append({
+                    "ref_poly": ref_poly_idx[ri],
+                    "ref": (rx, ry, rz),
+                    "out": best_foot,
+                    "d3d": best_d if best_foot is not None else 9999,
+                    "dx": abs(rx - foot[0]),
+                    "dy": abs(ry - foot[1]),
+                    "dz": abs(rz - foot[2]),
+                })
+        return out_verts, ref_verts, violations
+
+    # Vertex-to-vertex comparison (pads)
     grid, cell = build_3d_grid(out_verts, cell=0.05)
-    SNAP = TOLERANCE * 3  # 30mm search radius for the grid lookup
+    SNAP = TOLERANCE * 3
+    grid_wide, cell_wide = build_3d_grid(out_verts, cell=0.2)
 
     violations = []
     for ri, (rx, ry, rz) in enumerate(ref_verts):
         d, oi = nearest_3d(rx, ry, rz, out_verts, grid, cell, SNAP)
-        if d is None or d > TOLERANCE:
-            # Also try with wider search if not found
-            if d is None or d > TOLERANCE:
-                # 50mm wider search
-                grid2, c2 = build_3d_grid(out_verts, cell=0.2)
-                d2, oi2 = nearest_3d(rx, ry, rz, out_verts, grid2, c2, 1.0)
-                if d2 is not None and d2 < (d or 9999):
-                    d, oi = d2, oi2
+        if oi is None or d > TOLERANCE:
+            d2, oi2 = nearest_3d(rx, ry, rz, out_verts, grid_wide, cell_wide, 5.0)
+            if oi2 is not None and (oi is None or d2 < d):
+                d, oi = d2, oi2
+        if oi is None or d > TOLERANCE:
             ox, oy, oz = out_verts[oi] if oi is not None else (rx, ry, rz)
             violations.append({
                 "ref_poly": ref_poly_idx[ri],
                 "ref": (rx, ry, rz),
                 "out": (ox, oy, oz) if oi is not None else None,
-                "d3d": d or 9999,
+                "d3d": d if oi is not None else 9999,
                 "dx": abs(rx - ox) if oi is not None else None,
                 "dy": abs(ry - oy) if oi is not None else None,
                 "dz": abs(rz - oz) if oi is not None else None,
@@ -125,11 +177,15 @@ def main():
     print(f"{'Layer':<40} {'OutP':>5} {'RefP':>5} {'OutV':>6} {'RefV':>6} {'Viols':>6}  {'MaxD mm':>8}  Status")
     print("=" * 100)
 
+    # Use segment projection for 3D_LINES (linework may have different vertex density)
+    SEGMENT_PROJ_LAYERS = {"3D_LINES"}
+
     all_viols = {}
     for layer in ref_layers:
         out_p = get_polylines(out_doc, layer)
         ref_p = get_polylines(ref_doc, layer)
-        out_v, ref_v, viols = compare_layer(out_p, ref_p)
+        use_seg = layer in SEGMENT_PROJ_LAYERS
+        out_v, ref_v, viols = compare_layer(out_p, ref_p, use_segment_projection=use_seg)
         all_viols[layer] = viols
         max_d = max((v["d3d"] for v in viols), default=0)
         status = "PASS" if not viols else f"FAIL ({len(viols)} verts)"

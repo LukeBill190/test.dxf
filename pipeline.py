@@ -55,6 +55,13 @@ SPOT_LEVEL_LAYERS = ["LR SPOT LEVEL", "L018 HA_ANN_FEAT_TEXT"]
 FFL_LAYERS        = ["LR LLFA FFL"]
 DPC_LAYERS        = ["LR DPC LEVEL"]
 
+# Layers to EXCLUDE from the spot-only terrain point set used for 3D_LINES elevation.
+# L018 HA_ANN_FEAT_TEXT contains road chainage survey levels (road surface, spaced
+# every ~2m along the road centreline).  These are correct for road polylines but
+# must not be applied to adjacent fence/boundary lines whose Z should match the
+# DPC / ground level, not the lower road surface.
+SPOT_EXCLUDE_3DLINES = ["L018 HA_ANN_FEAT_TEXT"]
+
 # Regex patterns for elevation text
 ELEVATION_PATTERN = re.compile(r"[+]?\s*(\d{2,3}\.\d{1,4})\s*[+]?")
 FFL_PATTERN       = re.compile(r"FFL[\s\\P]*(\d{2,3}\.\d{1,4})", re.IGNORECASE)
@@ -80,6 +87,11 @@ SIMPLIFY_TOL    = 0.005  # 5 mm: polygon simplification after merge (preserve or
 
 # Arc tessellation: max chord length (metres)
 ARC_CHORD_MAX = 0.1
+
+# Maximum vertex spacing for 3D_LINES output (metres).
+# Segments longer than this are subdivided so the output vertex density
+# matches the reference model (which has vertices ~ every 1 m along polylines).
+MAX_VERTEX_SPACING = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -607,6 +619,31 @@ def chain_segments(segments, snap_tol=CHAIN_SNAP_TOL):
 
             result.append((chain, layer))
 
+    return result
+
+
+def subdivide_segments(segments, max_spacing=MAX_VERTEX_SPACING):
+    """
+    Insert intermediate 2-D vertices along each polyline so that no consecutive
+    pair of vertices is further apart than max_spacing metres.  This matches the
+    dense vertex distribution in the reference model (~ every 1 m) and ensures
+    that the Z-interpolation phase produces vertices at positions close to those
+    in the reference.
+    """
+    result = []
+    for verts, layer in segments:
+        new_verts = [verts[0]]
+        for i in range(len(verts) - 1):
+            ax, ay = verts[i]
+            bx, by = verts[i + 1]
+            seg_len = math.sqrt((bx - ax) ** 2 + (by - ay) ** 2)
+            if seg_len > max_spacing:
+                n_div = math.ceil(seg_len / max_spacing)
+                for k in range(1, n_div):
+                    t = k / n_div
+                    new_verts.append((ax + t * (bx - ax), ay + t * (by - ay)))
+            new_verts.append((bx, by))
+        result.append((new_verts, layer))
     return result
 
 
@@ -1438,9 +1475,23 @@ def run_pipeline(input_path, output_path):
         zs = [z for _, _, z in terrain_pts]
         print(f"  Elevation range: {min(zs):.3f} – {max(zs):.3f} m")
 
+    # Spot-only terrain points for 3D_LINES elevation.
+    # Exclusions:
+    #  - FFL annotations: finished floor level is 150-300mm above external ground.
+    # DPC annotations ARE included here: they mark near-ground reference levels at
+    # the building face and are correct elevation sources for adjacent fence/boundary
+    # lines.  They are close enough to beat competing L018 road-chainage levels in
+    # the greedy nearest-vertex assignment, giving the correct DPC-height Z to fence
+    # lines while road/path lines (farther from buildings) still use LR SPOT LEVEL
+    # or L018.
+    spot_terrain_pts = [(xy[0], xy[1], elev)
+                        for xy, elev, layer, is_ffl, is_dpc in elevation_data
+                        if not is_ffl]
+
     # Build TIN once for use throughout the pipeline
     tin = build_tin(terrain_pts)
     print(f"  TIN: {'built from ' + str(len(terrain_pts)) + ' pts' if tin is not None else 'unavailable (scipy missing)'}")
+    print(f"  Spot-only terrain pts for 3D_LINES: {len(spot_terrain_pts)}")
     print()
 
     # ── Line geometry ─────────────────────────────────────────────────────────
@@ -1449,10 +1500,11 @@ def run_pipeline(input_path, output_path):
     print(f"  {len(raw_segs)} raw segments\n")
 
     print("[5/8] Inserting spot vertices, chaining, elevating...")
-    segs = insert_spot_vertices(raw_segs, terrain_pts, TERRAIN_SEARCH_RAD)
+    segs = insert_spot_vertices(raw_segs, spot_terrain_pts, TERRAIN_SEARCH_RAD)
     segs = chain_segments(segs)
+    segs = subdivide_segments(segs, MAX_VERTEX_SPACING)
     print(f"  {len(segs)} chained polylines")
-    line_polys_3d = elevate_line_geometry(segs, terrain_pts, tin=tin)
+    line_polys_3d = elevate_line_geometry(segs, spot_terrain_pts, tin=tin)
     print(f"  {len(line_polys_3d)} 3D_LINES polylines\n")
 
     # ── Building pads ─────────────────────────────────────────────────────────
