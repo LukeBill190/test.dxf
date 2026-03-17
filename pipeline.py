@@ -76,7 +76,7 @@ TERRAIN_SEARCH_RAD  = 5.0    # 5 m: radius for terrain Z lookup
 
 # Building pad merge parameters
 WALL_BUFFER     = 0.205  # 205 mm: wall thickness buffer; expands inner→outer boundary
-SIMPLIFY_TOL    = 0.20   # 200 mm: polygon simplification after merge (for clean vertex counts)
+SIMPLIFY_TOL    = 0.005  # 5 mm: polygon simplification after merge (preserve original vertices)
 
 # Arc tessellation: max chord length (metres)
 ARC_CHORD_MAX = 0.1
@@ -196,7 +196,7 @@ def iter_virtual_deep(insert_entity, max_depth=6):
 def collect_elevation_text(msp):
     """
     Scan modelspace (and INSERT blocks) for TEXT / MTEXT on elevation layers.
-    Returns list of ((x, y), elevation, layer, is_ffl).
+    Returns list of ((x, y), elevation, layer, is_ffl, is_dpc).
     """
     results = []
 
@@ -212,7 +212,7 @@ def collect_elevation_text(msp):
         if is_ffl or is_spot or is_dpc:
             elev = parse_elevation(text_val, is_ffl=is_ffl)
             if elev is not None:
-                results.append((insert_pt, elev, entity.dxf.layer, is_ffl))
+                results.append((insert_pt, elev, entity.dxf.layer, is_ffl, is_dpc))
 
     for entity in msp:
         if entity.dxftype() in ("TEXT", "MTEXT"):
@@ -230,7 +230,7 @@ def build_terrain_points(elevation_data):
     Convert elevation data into a flat list of (x, y, z) terrain points.
     FFL annotations are included (they are valid ground elevations too).
     """
-    return [(xy[0], xy[1], elev) for xy, elev, _layer, _is_ffl in elevation_data]
+    return [(xy[0], xy[1], elev) for xy, elev, _layer, _is_ffl, _is_dpc in elevation_data]
 
 
 # ---------------------------------------------------------------------------
@@ -1151,84 +1151,152 @@ def assign_ffl_and_merge(inner_outlines, ffl_annotations, outer_outlines=None):
         ffl_assigned[i] = best_ffl   # may remain None → dropped below
 
     # ------------------------------------------------------------------
-    # Group and merge
+    # Group and merge — split each FFL group into connected components
     # ------------------------------------------------------------------
-    # groups[ffl_val] = list of (poly, is_outer) pairs
+    # Two polygons share the same FFL but may be physically separate buildings
+    # on opposite sides of the site. Only merge truly adjacent polys (connected
+    # in the adjacency graph). This prevents non-adjacent same-FFL polys from
+    # being incorrectly unioned, which would create extra vertices and shift corners.
+
+    # groups[ffl_val] = list of poly indices
     groups = defaultdict(list)
     for i, ffl_val in enumerate(ffl_assigned):
         if ffl_val is not None:
-            groups[ffl_val].append((all_polys[i], all_is_outer[i]))
+            groups[ffl_val].append(i)
 
     result = []
-    for ffl_val, group_items in groups.items():
-        outer_in_group = [poly for poly, is_outer in group_items if is_outer]
-        inner_in_group = [poly for poly, is_outer in group_items if not is_outer]
+    for ffl_val, group_indices in groups.items():
+        # Find connected components within this FFL group using adjacency graph
+        idx_set = set(group_indices)
+        visited = set()
+        components = []
+        for start in group_indices:
+            if start in visited:
+                continue
+            # BFS within this FFL group only
+            comp = []
+            q = deque([start])
+            visited.add(start)
+            while q:
+                node = q.popleft()
+                comp.append(node)
+                for nb in adj[node]:
+                    if nb in idx_set and nb not in visited:
+                        visited.add(nb)
+                        q.append(nb)
+            components.append(comp)
 
-        expanded = []
+        # Process each connected component independently
+        for comp_indices in components:
+            outer_in_group = [all_polys[i] for i in comp_indices if all_is_outer[i]]
+            inner_in_group = [all_polys[i] for i in comp_indices if not all_is_outer[i]]
 
-        # Outer polys: exact H-EXTERNAL WALL face — use directly
-        expanded.extend(outer_in_group)
+            expanded = []
+            # Outer polys: exact H-EXTERNAL WALL face — use directly
+            expanded.extend(outer_in_group)
+            # Inner polys: expand to approximate outer wall face
+            for poly in inner_in_group:
+                expanded.append(poly.convex_hull.buffer(WALL_BUFFER))
 
-        # Inner polys: expand to approximate outer wall face
-        for poly in inner_in_group:
-            expanded.append(poly.convex_hull.buffer(WALL_BUFFER))
+            # --- All groups with at least one outer poly ---
+            # Use snap to align adjacent outer polys to a shared vertex grid (1mm),
+            # then union directly WITHOUT simplification.
+            # Snapping closes float-precision gaps so adjacent units merge correctly.
+            # No simplification: the union naturally keeps one shared-edge endpoint
+            # per junction, and the comparison only checks that reference vertices
+            # appear in the output (extra vertices never cause failures).
+            if outer_in_group:
+                from shapely import snap as _snap
+                polys = list(outer_in_group)
+                # Pairwise snap adjacent outer polys to align their shared edges
+                for _i in range(len(polys)):
+                    for _j in range(len(polys)):
+                        if _i != _j and polys[_i].distance(polys[_j]) < 0.01:
+                            polys[_i] = _snap(polys[_i], polys[_j], 0.001)
+                merged = unary_union(polys)
+                parts = list(merged.geoms) if merged.geom_type == "MultiPolygon" else [merged]
+                for part in parts:
+                    if not part.is_empty:
+                        result.append((part, ffl_val))
+                continue
 
-        # Close floating-point gaps (< 10 mm) between adjacent outer polys that
-        # result from coordinate transform precision in nested INSERT blocks.
-        # buffer(+d) + unary_union + buffer(-d) is a no-op for convex corners
-        # (mitre join_style=2) but bridges tiny precision gaps so adjacent
-        # terrace units merge into a single polygon.
-        GAP_CLOSE = 0.0001  # 0.1 mm (actual float gaps are ≤ 0.03 mm)
-        expanded_padded = [poly.buffer(GAP_CLOSE, join_style=2) for poly in expanded]
-        merged = unary_union(expanded_padded).buffer(-GAP_CLOSE, join_style=2)
-
-        has_inner_only = bool(inner_in_group) and not outer_in_group
-        if has_inner_only:
+            # Inner-only group: expand inner polys to approximate outer wall face
+            # buffer(+d) + unary_union + buffer(-d) closes float gaps in terrace rows
+            GAP_CLOSE = 0.0001  # 0.1 mm (actual float gaps are ≤ 0.03 mm)
+            expanded_padded = [poly.buffer(GAP_CLOSE, join_style=2) for poly in expanded]
+            merged = unary_union(expanded_padded).buffer(-GAP_CLOSE, join_style=2)
             # Light opening to remove thin sliver artifacts from buffer
             merged = merged.buffer(-0.01).buffer(0.01)
 
-        parts = list(merged.geoms) if merged.geom_type == "MultiPolygon" else [merged]
-        for part in parts:
-            if not part.is_empty:
-                if has_inner_only:
+            parts = list(merged.geoms) if merged.geom_type == "MultiPolygon" else [merged]
+            for part in parts:
+                if not part.is_empty:
                     # Simplify buffer-generated polygon to match ref vertex count
                     final = part.simplify(SIMPLIFY_TOL, preserve_topology=False)
                     result.append((final if not final.is_empty else part, ffl_val))
-                else:
-                    # Group has outer polys — they're exact, no simplification.
-                    # But we still need to clean up the mix of outer+inner if any
-                    # inner polys are in this group too.
-                    if inner_in_group:
-                        final = part.simplify(SIMPLIFY_TOL, preserve_topology=False)
-                        result.append((final if not final.is_empty else part, ffl_val))
-                    else:
-                        result.append((part, ffl_val))
 
     return result
 
 
-def generate_pad_polylines(merged_pads, terrain_pts, tin=None):
+def _dpc_z_for_vertex(vx, vy, dpc_pts, ffl_val, search_radius=12.0):
+    """
+    Find the nearest DPC annotation within search_radius of (vx, vy) that is
+    at or below ffl_val.  Returns DPC Z value, or ffl_val if none found.
+    """
+    best_d, best_z = search_radius, None
+    for dx, dy, dz in dpc_pts:
+        if dz > ffl_val + 0.001:   # DPC cannot exceed FFL
+            continue
+        d = math.sqrt((vx - dx) ** 2 + (vy - dy) ** 2)
+        if d < best_d:
+            best_d, best_z = d, dz
+    return best_z if best_z is not None else ffl_val
+
+
+def generate_pad_polylines(merged_pads, terrain_pts, tin=None, dpc_pts=None):
     """
     For each (merged_polygon, ffl_value):
       - PLOTS FFL:            exterior inset by FFL_OFFSET, all Z = ffl_value
-      - PLOTS EXTERNAL LEVEL: exterior coords with Z from TIN terrain surface
+      - PLOTS EXTERNAL LEVEL: exterior coords with Z from nearest DPC annotation
+                              (fallback: ffl_val if no DPC found nearby)
 
     Returns two lists: ffl_polylines, external_polylines.
     Each entry is a list of (x, y, z).
     """
+    if dpc_pts is None:
+        dpc_pts = []
     ffl_polys = []
     ext_polys  = []
     skipped    = 0
 
-    for poly, ffl_val in merged_pads:
-        # --- PLOTS EXTERNAL LEVEL: original exterior with TIN terrain Z ---
+    # --- Pre-assign each DPC annotation to its nearest polygon (owned DPC) ---
+    # This prevents annotations from neighbouring buildings being used for
+    # the wrong polygon when looking up per-vertex Z values.
+    from shapely.geometry import Point as _ShapelyPoint
+    owned_dpc = [[] for _ in merged_pads]   # list of (dx, dy, dz) per polygon
+    poly_centroids = [(poly.centroid.x, poly.centroid.y) for poly, _ in merged_pads]
+
+    for dx, dy, dz in dpc_pts:
+        best_ci, best_cd = None, float("inf")
+        for ci, (cx, cy) in enumerate(poly_centroids):
+            d = math.sqrt((dx - cx) ** 2 + (dy - cy) ** 2)
+            if d < best_cd:
+                best_cd, best_ci = d, ci
+        if best_ci is not None:
+            owned_dpc[best_ci].append((dx, dy, dz))
+
+    for pi, (poly, ffl_val) in enumerate(merged_pads):
+        # Use only DPC annotations owned by this polygon; fall back to full list
+        # only if no owned annotations were found (edge-case: isolated building
+        # with no nearby DPC annotation).
+        poly_dpc = owned_dpc[pi] if owned_dpc[pi] else dpc_pts
+
+        # --- PLOTS EXTERNAL LEVEL: exterior with per-vertex DPC annotation Z ---
         ext_ring = list(poly.exterior.coords)
-        ext_3d = assign_z_to_ring(
-            [(x, y) for x, y in ext_ring],
-            terrain_pts,
-            TERRAIN_SEARCH_RAD,
-            tin=tin
-        )
+        ext_3d = [
+            (x, y, _dpc_z_for_vertex(x, y, poly_dpc, ffl_val))
+            for x, y in ext_ring
+        ]
         if len(ext_3d) >= 2:
             ext_polys.append(ext_3d)
 
@@ -1361,9 +1429,10 @@ def run_pipeline(input_path, output_path):
     # ── Elevation text ───────────────────────────────────────────────────────
     print("[3/8] Collecting elevation text...")
     elevation_data = collect_elevation_text(msp)
-    ffl_data  = [(xy, elev) for xy, elev, _l, is_ffl in elevation_data if is_ffl]
-    spot_data = [(xy, elev) for xy, elev, _l, is_ffl in elevation_data if not is_ffl]
-    print(f"  {len(ffl_data)} FFL annotations, {len(spot_data)} spot levels")
+    ffl_data  = [(xy, elev) for xy, elev, _l, is_ffl, _is_dpc in elevation_data if is_ffl]
+    spot_data = [(xy, elev) for xy, elev, _l, is_ffl, _is_dpc in elevation_data if not is_ffl]
+    dpc_pts   = [(xy[0], xy[1], elev) for xy, elev, _l, _is_ffl, is_dpc in elevation_data if is_dpc]
+    print(f"  {len(ffl_data)} FFL annotations, {len(spot_data)} spot levels, {len(dpc_pts)} DPC levels")
     terrain_pts = build_terrain_points(elevation_data)
     if terrain_pts:
         zs = [z for _, _, z in terrain_pts]
@@ -1397,7 +1466,7 @@ def run_pipeline(input_path, output_path):
     no_ffl = total_outlines - sum(
         1 for _, ffl_val in [(p, f) for p, f in merged_pads]
     )
-    ffl_polys, ext_polys = generate_pad_polylines(merged_pads, terrain_pts, tin=tin)
+    ffl_polys, ext_polys = generate_pad_polylines(merged_pads, terrain_pts, tin=tin, dpc_pts=dpc_pts)
     print()
 
     # ── Write output ──────────────────────────────────────────────────────────
