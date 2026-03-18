@@ -162,7 +162,13 @@ def collect_input_line_verts(msp):
                 verts.append((pt[0], pt[1], lt))
         elif ent.dxftype() == "POLYLINE":
             for v in ent.vertices:
-                p = v.dxf.point
+                try:
+                    p = v.dxf.location
+                except Exception:
+                    try:
+                        p = v.dxf.point
+                    except Exception:
+                        continue
                 verts.append((p.x, p.y, lt))
         elif ent.dxftype() in ("ARC", "CIRCLE"):
             # Tessellate arc into ~16 points
