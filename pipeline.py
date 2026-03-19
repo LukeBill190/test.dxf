@@ -49,6 +49,7 @@ BUILDING_SUPPRESS_LAYERS = ["EXTERNAL PARTY WALL"]  # exclude from 3D_LINES but 
 DRIVE_KEYWORDS  = ["drive", "path"]
 FENCE_KEYWORDS  = ["fence", "wall", "boundary"]
 ROAD_KEYWORDS   = ["road", "footpath", "kerb"]
+POND_KEYWORDS   = ["pond", "water", "suds", "attenuation", "earthworks"]
 
 # Elevation text source layers — substring patterns (case-insensitive).
 # Multiple aliases per type handle different surveying firm conventions, e.g.:
@@ -83,10 +84,8 @@ FFL_OFFSET = 0.025   # 25 mm
 CHAIN_SNAP_TOL      = 0.05   # 50 mm: endpoint match when chaining segments
 VERTEX_INSERT_RADIUS = 0.3   # 300 mm: snap radius for spot-level vertex insertion
 ADJACENCY_TOL       = 0.35   # 350 mm: plots within this distance are adjacent (crosses party walls)
-TERRAIN_SEARCH_RAD       = 5.0   # 5 m: radius for terrain Z lookup (drives/roads)
-FENCE_TERRAIN_SEARCH_RAD = 8.0   # 8 m: fence lines search further to reach DPC levels
-#                                       (DPC annotations sit at the building face and
-#                                        may be 5-8 m from the adjacent fence line)
+TERRAIN_SEARCH_RAD       = 0.5   # 500 mm: max radius for spot-level Z lookup
+FENCE_TERRAIN_SEARCH_RAD = 0.5   # 500 mm: same for fence/boundary lines
 
 # Building pad merge parameters
 WALL_BUFFER     = 0.205  # 205 mm: wall thickness buffer; expands inner→outer boundary
@@ -127,11 +126,12 @@ def _is_pad_source_layer(layer_name):
 
 
 def _classify_layer_ml(layer_name):
-    """Return 'fence', 'drive', 'road', or None for ML feature extraction."""
+    """Return 'fence', 'drive', 'road', 'pond', or None for ML feature extraction."""
     ll = layer_name.lower()
     if any(kw in ll for kw in FENCE_KEYWORDS): return "fence"
     if any(kw in ll for kw in DRIVE_KEYWORDS): return "drive"
     if any(kw in ll for kw in ROAD_KEYWORDS):  return "road"
+    if any(kw in ll for kw in POND_KEYWORDS):  return "pond"
     return None
 
 
@@ -148,7 +148,7 @@ def _is_suppress_from_lines(layer_name):
 
 
 def classify_layer(layer_name):
-    """Classify a layer as drive / fence / road, or return None."""
+    """Classify a layer as drive / fence / road / pond, or return None."""
     lu = layer_name.upper()
     for kw in DRIVE_KEYWORDS:
         if kw.upper() in lu:
@@ -159,6 +159,9 @@ def classify_layer(layer_name):
     for kw in ROAD_KEYWORDS:
         if kw.upper() in lu:
             return "road"
+    for kw in POND_KEYWORDS:
+        if kw.upper() in lu:
+            return "pond"
     return None
 
 
@@ -516,7 +519,7 @@ def collect_line_geometry(msp):
 # Phase 4 – Insert intermediate spot-level vertices, chain, elevate → 3D_LINES
 # ---------------------------------------------------------------------------
 
-def insert_spot_vertices(segments, terrain_pts, search_radius=5.0):
+def insert_spot_vertices(segments, terrain_pts, search_radius=TERRAIN_SEARCH_RAD):
     """
     For each terrain point that has no existing vertex within
     VERTEX_INSERT_RADIUS on any segment, split the nearest segment there.
@@ -538,8 +541,8 @@ def insert_spot_vertices(segments, terrain_pts, search_radius=5.0):
         if nearby:
             continue
 
-        # Find nearest edge within TERRAIN_SEARCH_RAD
-        best_dist = TERRAIN_SEARCH_RAD
+        # Find nearest edge within search_radius
+        best_dist = search_radius
         best_seg = best_edge = best_t = None
 
         for si, pts in enumerate(pts_list):
