@@ -49,10 +49,10 @@ import numpy as np
 # Multiple aliases per type handle different surveying firm conventions, e.g.:
 #   "LR SPOT LEVEL"         (standard)
 #   "5_E-Spot Levels"       (alternate firm convention)
-SPOT_LAYERS  = ["SPOT LEVEL"]               # matches "LR SPOT LEVEL", "5_E-Spot Levels", etc.
-DPC_LAYERS   = ["DPC LEVEL", "DPC"]         # matches "LR DPC LEVEL"
+SPOT_LAYERS  = ["SPOT LEVEL", "PROP-LEVELS", "EXIST-LEVELS"]  # matches "LR SPOT LEVEL", "REFA-EXT.W-Prop-Levels", etc.
+DPC_LAYERS   = ["DPC LEVEL", "DPC"]                           # matches "LR DPC LEVEL"
 L018_LAYERS  = ["L018 HA_ANN_FEAT_TEXT"]
-FFL_LAYERS   = ["LLFA FFL", "FINISHED FLOOR", "FFL LEVEL"]  # matches "LR LLFA FFL", "5_E-Finished Floor Levels"
+FFL_LAYERS   = ["LLFA FFL", "FINISHED FLOOR", "FFL LEVEL", "FFL"]  # matches "LR LLFA FFL", "_REFA_ FFLs", etc.
 BLDG_LAYERS  = ["H-PLOT OUTLINE INNER", "H-EXTERNAL WALL", "HOUSE"]
 
 DRIVE_KW = ["drive", "path"]

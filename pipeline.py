@@ -53,11 +53,14 @@ POND_KEYWORDS   = ["pond", "water", "suds", "attenuation", "earthworks"]
 
 # Elevation text source layers — substring patterns (case-insensitive).
 # Multiple aliases per type handle different surveying firm conventions, e.g.:
-#   "LR SPOT LEVEL" / "5_E-Spot Levels" — both contain "SPOT LEVEL"
-#   "LR LLFA FFL"                        — contains "LLFA FFL"
-#   "5_E-Finished Floor Levels"           — contains "FINISHED FLOOR"
-SPOT_LEVEL_LAYERS = ["SPOT LEVEL", "L018 HA_ANN_FEAT_TEXT"]
-FFL_LAYERS        = ["LLFA FFL", "FINISHED FLOOR"]
+#   "LR SPOT LEVEL" / "5_E-Spot Levels"    — both contain "SPOT LEVEL"
+#   "LR LLFA FFL"                           — contains "LLFA FFL"
+#   "5_E-Finished Floor Levels"             — contains "FINISHED FLOOR"
+#   "REFA-EXT.W-Prop-Levels"               — contains "PROP-LEVELS"
+#   "REFA-EXT.W-Exist-Levels"              — contains "EXIST-LEVELS"
+#   "_REFA_ FFLs"                           — contains "FFL"
+SPOT_LEVEL_LAYERS = ["SPOT LEVEL", "L018 HA_ANN_FEAT_TEXT", "PROP-LEVELS", "EXIST-LEVELS"]
+FFL_LAYERS        = ["LLFA FFL", "FINISHED FLOOR", "FFL"]
 DPC_LAYERS        = ["DPC LEVEL"]
 
 # Layers to EXCLUDE from the spot-only terrain point set used for 3D_LINES elevation.
