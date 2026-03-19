@@ -50,10 +50,14 @@ DRIVE_KEYWORDS  = ["drive", "path"]
 FENCE_KEYWORDS  = ["fence", "wall", "boundary"]
 ROAD_KEYWORDS   = ["road", "footpath", "kerb"]
 
-# Elevation text source layers
-SPOT_LEVEL_LAYERS = ["LR SPOT LEVEL", "L018 HA_ANN_FEAT_TEXT"]
-FFL_LAYERS        = ["LR LLFA FFL"]
-DPC_LAYERS        = ["LR DPC LEVEL"]
+# Elevation text source layers — substring patterns (case-insensitive).
+# Multiple aliases per type handle different surveying firm conventions, e.g.:
+#   "LR SPOT LEVEL" / "5_E-Spot Levels" — both contain "SPOT LEVEL"
+#   "LR LLFA FFL"                        — contains "LLFA FFL"
+#   "5_E-Finished Floor Levels"           — contains "FINISHED FLOOR"
+SPOT_LEVEL_LAYERS = ["SPOT LEVEL", "L018 HA_ANN_FEAT_TEXT"]
+FFL_LAYERS        = ["LLFA FFL", "FINISHED FLOOR"]
+DPC_LAYERS        = ["DPC LEVEL"]
 
 # Layers to EXCLUDE from the spot-only terrain point set used for 3D_LINES elevation.
 # L018 HA_ANN_FEAT_TEXT contains road chainage survey levels (road surface, spaced

@@ -45,11 +45,15 @@ import numpy as np
 # ---------------------------------------------------------------------------
 # Constants — must match pipeline.py
 # ---------------------------------------------------------------------------
-SPOT_LAYERS  = ["LR SPOT LEVEL"]
-DPC_LAYERS   = ["LR DPC LEVEL"]
+# Substring patterns for annotation layer detection (case-insensitive).
+# Multiple aliases per type handle different surveying firm conventions, e.g.:
+#   "LR SPOT LEVEL"         (standard)
+#   "5_E-Spot Levels"       (alternate firm convention)
+SPOT_LAYERS  = ["SPOT LEVEL"]               # matches "LR SPOT LEVEL", "5_E-Spot Levels", etc.
+DPC_LAYERS   = ["DPC LEVEL", "DPC"]         # matches "LR DPC LEVEL"
 L018_LAYERS  = ["L018 HA_ANN_FEAT_TEXT"]
-FFL_LAYERS   = ["LR LLFA FFL"]
-BLDG_LAYERS  = ["H-PLOT OUTLINE INNER", "H-EXTERNAL WALL"]
+FFL_LAYERS   = ["LLFA FFL", "FINISHED FLOOR", "FFL LEVEL"]  # matches "LR LLFA FFL", "5_E-Finished Floor Levels"
+BLDG_LAYERS  = ["H-PLOT OUTLINE INNER", "H-EXTERNAL WALL", "HOUSE"]
 
 DRIVE_KW = ["drive", "path"]
 FENCE_KW = ["fence", "wall", "boundary"]
@@ -158,7 +162,13 @@ def collect_input_line_verts(msp):
                 verts.append((pt[0], pt[1], lt))
         elif ent.dxftype() == "POLYLINE":
             for v in ent.vertices:
-                p = v.dxf.point
+                try:
+                    p = v.dxf.location
+                except Exception:
+                    try:
+                        p = v.dxf.point
+                    except Exception:
+                        continue
                 verts.append((p.x, p.y, lt))
         elif ent.dxftype() in ("ARC", "CIRCLE"):
             # Tessellate arc into ~16 points
