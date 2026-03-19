@@ -818,7 +818,8 @@ def elevate_line_geometry(segments, terrain_pts, tin=None,
                           search_radius=TERRAIN_SEARCH_RAD,
                           shared_assignment=False,
                           ml_payload=None, ann_by_type=None,
-                          bldg_verts_ml=None, site_median_z=None):
+                          bldg_verts_ml=None, site_median_z=None,
+                          rwall_segs_ml=None):
     """
     Assign Z to every vertex in every segment.
 
@@ -849,7 +850,8 @@ def elevate_line_geometry(segments, terrain_pts, tin=None,
                 # ML predictions for all vertices (cheap batch call)
                 z_preds = _ml_elevation.predict_z_batch(
                     verts_2d, layer_type, ann_by_type,
-                    bldg_verts_ml or [], site_median_z or 0.0, ml_payload
+                    bldg_verts_ml or [], site_median_z or 0.0, ml_payload,
+                    rwall_segs=rwall_segs_ml or [],
                 )
                 # Phase 1 seeds: only use ML Z for vertices near terrain
                 z_precomputed = [z_preds[i] if near_mask[i] else None
@@ -1630,23 +1632,30 @@ def run_pipeline(input_path, output_path):
     _ml_payload = None
     _ann_by_type = None
     _bldg_verts_ml = None
+    _rwall_segs_ml = None
     _site_median_z = None
     if _HAS_ML:
         _ml_payload = _ml_elevation.load_model()
         if _ml_payload:
-            # Build annotation dict for ML feature extraction (same format as ml_elevation)
+            # Build annotation dict for ML feature extraction (same format as ml_elevation).
+            # Use the same substring patterns as ml_elevation so all surveying firms match.
+            _spot_kw = [s.upper() for s in _ml_elevation.SPOT_LAYERS]
+            _dpc_kw  = [s.upper() for s in _ml_elevation.DPC_LAYERS]
+            _l018_kw = [s.upper() for s in _ml_elevation.L018_LAYERS]
+            _ffl_kw  = [s.upper() for s in _ml_elevation.FFL_LAYERS]
             _ann_by_type = {"SPOT": [], "DPC": [], "L018": [], "FFL": []}
             for xy, elev, layer, is_ffl, is_dpc in elevation_data:
                 lu = layer.upper()
-                if "LR SPOT LEVEL" in lu:
+                if any(kw in lu for kw in _spot_kw):
                     _ann_by_type["SPOT"].append((xy[0], xy[1], elev, "SPOT"))
-                elif "LR DPC LEVEL" in lu:
+                elif any(kw in lu for kw in _dpc_kw):
                     _ann_by_type["DPC"].append((xy[0], xy[1], elev, "DPC"))
-                elif "L018 HA_ANN_FEAT_TEXT" in lu:
+                elif any(kw in lu for kw in _l018_kw):
                     _ann_by_type["L018"].append((xy[0], xy[1], elev, "L018"))
-                elif "LR LLFA FFL" in lu:
+                elif any(kw in lu for kw in _ffl_kw):
                     _ann_by_type["FFL"].append((xy[0], xy[1], elev, "FFL"))
             _bldg_verts_ml = _ml_elevation.collect_building_verts(msp)
+            _rwall_segs_ml = _ml_elevation.collect_rwall_segments(msp)
             all_z = [elev for _, elev, _, _, _ in elevation_data]
             if all_z:
                 sorted_z = sorted(all_z)
@@ -1672,6 +1681,7 @@ def run_pipeline(input_path, output_path):
         segs, spot_terrain_pts, tin=tin,
         ml_payload=_ml_payload, ann_by_type=_ann_by_type,
         bldg_verts_ml=_bldg_verts_ml, site_median_z=_site_median_z,
+        rwall_segs_ml=_rwall_segs_ml,
     )
     print(f"  {len(line_polys_3d)} 3D_LINES polylines\n")
 
