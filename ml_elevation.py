@@ -49,11 +49,15 @@ import numpy as np
 # Multiple aliases per type handle different surveying firm conventions, e.g.:
 #   "LR SPOT LEVEL"         (standard)
 #   "5_E-Spot Levels"       (alternate firm convention)
-SPOT_LAYERS  = ["SPOT LEVEL"]               # matches "LR SPOT LEVEL", "5_E-Spot Levels", etc.
-DPC_LAYERS   = ["DPC LEVEL", "DPC"]         # matches "LR DPC LEVEL"
+SPOT_LAYERS  = ["SPOT LEVEL", "PROP-LEVELS", "EXIST-LEVELS", "PROPOSED LEVEL", "EXT LEVEL", "EXTERNAL LEVEL", "PV LEVEL"]  # matches "LR SPOT LEVEL", "REFA-EXT.W-Prop-Levels", "OEC-Ext Wks - Proposed Levels", "_ENG_Ext Levels", "-m-ec_external levels", "PV LEVEL" (attrib block), etc.
+DPC_LAYERS   = ["DPC LEVEL", "DPC"]                           # matches "LR DPC LEVEL"
 L018_LAYERS  = ["L018 HA_ANN_FEAT_TEXT"]
-FFL_LAYERS   = ["LLFA FFL", "FINISHED FLOOR", "FFL LEVEL"]  # matches "LR LLFA FFL", "5_E-Finished Floor Levels"
+FFL_LAYERS   = ["LLFA FFL", "FINISHED FLOOR", "FFL LEVEL", "FFL"]  # matches "LR LLFA FFL", "_REFA_ FFLs", etc.
 BLDG_LAYERS  = ["H-PLOT OUTLINE INNER", "H-EXTERNAL WALL", "HOUSE"]
+# Retaining wall geometry layers — used to compute wall-side feature.
+# "RETAINING" matches "P_Retaining Wall *"; "BATTER" matches batter/toe lines;
+# "RET-WALL" matches "REFA-EXT.W-Ret-Wall"; "RWALL" matches "_ENG_RWall*".
+RWALL_LAYERS = ["RETAINING", "BATTER", "RET-WALL", "RWALL"]
 
 DRIVE_KW = ["drive", "path"]
 FENCE_KW = ["fence", "wall", "boundary"]
@@ -69,8 +73,9 @@ FEAT_RADIUS = 20.0
 MIN_OWNED_VERTS = 30
 # A vertex is "directly owned" (not interpolated) if its Z matches a terrain
 # annotation within this distance and Z tolerance.
-OWNED_XY_RADIUS  = 2.0   # metres
-OWNED_Z_TOL      = 0.012  # 12 mm
+OWNED_XY_RADIUS      = 2.0   # metres — for SPOT/DPC/L018 annotations
+OWNED_XY_RADIUS_FFL  = 3.0   # metres — wider fallback when only FFL annotations exist
+OWNED_Z_TOL          = 0.012  # 12 mm
 
 MODEL_PATH_DEFAULT = Path(__file__).parent / "elevation_model.pkl"
 DATA_DIR_DEFAULT   = Path(__file__).parent / "training_data"
@@ -102,30 +107,68 @@ def _parse_z(text):
     return float(nums[0]) if nums else None
 
 
+def _iter_virtual_deep(insert_entity, max_depth=6):
+    """Yield all virtual entities from a nested INSERT, recursively.
+    ezdxf's virtual_entities() applies the INSERT transform so returned
+    entities are in world coordinates."""
+    if max_depth <= 0:
+        return
+    try:
+        for sub in insert_entity.virtual_entities():
+            yield sub
+            if sub.dxftype() == "INSERT":
+                yield from _iter_virtual_deep(sub, max_depth - 1)
+    except Exception:
+        pass
+
+
 def collect_annotations(msp):
-    """Return list of (x, y, z, ann_type) for all elevation text in modelspace."""
+    """Return list of (x, y, z, ann_type) for all elevation text in modelspace.
+
+    Also bursts INSERT (block) entities so that TEXT/MTEXT carried inside
+    block definitions — with their attribute values — are included at their
+    correct world coordinates.  This handles surveying conventions where firms
+    group level annotations inside a named block inserted once at the origin.
+    """
     annotations = []
-    for ent in msp:
-        if ent.dxftype() not in ("TEXT", "MTEXT"):
-            continue
+
+    def _try_text(ent):
+        if ent.dxftype() not in ("TEXT", "MTEXT", "ATTRIB"):
+            return
         try:
             xy = (ent.dxf.insert.x, ent.dxf.insert.y)
         except Exception:
-            continue
+            return
         try:
-            txt = ent.dxf.text if ent.dxftype() == "TEXT" else ent.text
+            txt = ent.text if ent.dxftype() == "MTEXT" else ent.dxf.text
         except Exception:
-            continue
+            return
         z = _parse_z(txt)
         if z is None:
-            continue
+            return
         layer = ent.dxf.layer
         if   any(s.upper() in layer.upper() for s in SPOT_LAYERS):  ann_type = "SPOT"
         elif any(s.upper() in layer.upper() for s in DPC_LAYERS):   ann_type = "DPC"
         elif any(s.upper() in layer.upper() for s in L018_LAYERS):  ann_type = "L018"
         elif any(s.upper() in layer.upper() for s in FFL_LAYERS):   ann_type = "FFL"
-        else: continue
+        else:
+            return
         annotations.append((xy[0], xy[1], z, ann_type))
+
+    for ent in msp:
+        if ent.dxftype() in ("TEXT", "MTEXT"):
+            _try_text(ent)
+        elif ent.dxftype() == "INSERT":
+            for sub in _iter_virtual_deep(ent):
+                _try_text(sub)
+            # ATTRIBs are not yielded by virtual_entities(); they belong to
+            # the INSERT itself and store their position already in WCS.
+            try:
+                for att in ent.attribs:
+                    _try_text(att)
+            except Exception:
+                pass
+
     return annotations
 
 
@@ -222,6 +265,96 @@ def collect_building_verts(msp):
     return bv
 
 
+def collect_rwall_segments(msp):
+    """
+    Return list of ((x1,y1),(x2,y2)) from retaining wall / batter geometry layers.
+    Used to compute the wall-side feature during training and inference.
+    """
+    segs = []
+    rwall_kw = [r.upper() for r in RWALL_LAYERS]
+    for ent in msp:
+        lu = ent.dxf.layer.upper()
+        if not any(kw in lu for kw in rwall_kw):
+            continue
+        if ent.dxftype() == "LINE":
+            s, e = ent.dxf.start, ent.dxf.end
+            segs.append(((s.x, s.y), (e.x, e.y)))
+        elif ent.dxftype() == "LWPOLYLINE":
+            pts = list(ent.get_points())
+            for i in range(len(pts) - 1):
+                segs.append(((pts[i][0], pts[i][1]), (pts[i+1][0], pts[i+1][1])))
+            if ent.closed and len(pts) > 1:
+                segs.append(((pts[-1][0], pts[-1][1]), (pts[0][0], pts[0][1])))
+        elif ent.dxftype() == "POLYLINE":
+            pverts = list(ent.vertices)
+            for i in range(len(pverts) - 1):
+                try:
+                    p0, p1 = pverts[i].dxf.location, pverts[i+1].dxf.location
+                    segs.append(((p0.x, p0.y), (p1.x, p1.y)))
+                except Exception:
+                    pass
+    return segs
+
+
+def wall_side_feature(vx, vy, rwall_segs, all_spots, site_median_z, radius=FEAT_RADIUS):
+    """
+    Return (wall_dist, wall_same_z_off, wall_opp_z_off) for the nearest wall segment.
+
+    wall_dist       : XY distance to nearest wall segment (capped at radius)
+    wall_same_z_off : z-offset of the nearest spot level on the SAME side of the
+                      nearest wall as the vertex (relative to site_median_z)
+    wall_opp_z_off  : z-offset of the nearest spot level on the OPPOSITE side
+
+    This avoids the signed-distance ambiguity (which depends on polyline draw direction)
+    by working in z-space: the model learns "target ≈ wall_same_z_off" regardless of
+    which side is geometrically "positive".
+
+    All three are zeroed (wall_dist=radius, z_offs=0) when no wall is nearby.
+    """
+    # Find nearest wall segment and store its geometry for side classification
+    best_dist = radius
+    best_x1 = best_y1 = best_dx = best_dy = 0.0
+    found_wall = False
+    for (x1, y1), (x2, y2) in rwall_segs:
+        dx, dy = x2 - x1, y2 - y1
+        seg_len_sq = dx * dx + dy * dy
+        if seg_len_sq < 1e-12:
+            d = math.sqrt((vx - x1) ** 2 + (vy - y1) ** 2)
+        else:
+            t = max(0.0, min(1.0, ((vx - x1) * dx + (vy - y1) * dy) / seg_len_sq))
+            cx, cy = x1 + t * dx, y1 + t * dy
+            d = math.sqrt((vx - cx) ** 2 + (vy - cy) ** 2)
+        if d < best_dist:
+            best_dist = d
+            best_x1, best_y1, best_dx, best_dy = x1, y1, dx, dy
+            found_wall = True
+
+    if not found_wall or not all_spots:
+        return best_dist, 0.0, 0.0
+
+    # Sign of vertex relative to nearest wall (cross product of wall dir × vertex offset)
+    vertex_cross = best_dx * (vy - best_y1) - best_dy * (vx - best_x1)
+
+    # Split spots into same-side and opposite-side; pick nearest of each
+    same_best = (radius, float('nan'))
+    opp_best  = (radius, float('nan'))
+    for ax, ay, az, _ in all_spots:
+        d = math.sqrt((ax - vx) ** 2 + (ay - vy) ** 2)
+        if d >= radius:
+            continue
+        spot_cross = best_dx * (ay - best_y1) - best_dy * (ax - best_x1)
+        if vertex_cross * spot_cross >= 0:   # same side (or on wall)
+            if d < same_best[0]:
+                same_best = (d, az)
+        else:
+            if d < opp_best[0]:
+                opp_best = (d, az)
+
+    same_z_off = (same_best[1] - site_median_z) if not math.isnan(same_best[1]) else 0.0
+    opp_z_off  = (opp_best[1]  - site_median_z) if not math.isnan(opp_best[1])  else 0.0
+    return best_dist, same_z_off, opp_z_off
+
+
 # ---------------------------------------------------------------------------
 # Feature extraction
 # ---------------------------------------------------------------------------
@@ -235,6 +368,7 @@ def _feature_names():
         for k in range(1, N_NEAR + 1):
             names += [f"{at}_dist_{k}", f"{at}_z_off_{k}"]
     names.append("bldg_dist")
+    names += ["wall_dist", "wall_same_z_off", "wall_opp_z_off"]
     return names
 
 
@@ -242,7 +376,8 @@ FEATURE_NAMES = _feature_names()
 N_FEATURES    = len(FEATURE_NAMES)
 
 
-def extract_features(vx, vy, layer_type, ann_by_type, bldg_verts, site_median_z):
+def extract_features(vx, vy, layer_type, ann_by_type, bldg_verts, site_median_z,
+                     rwall_segs=None):
     """
     Build the feature vector for a single vertex.
 
@@ -253,6 +388,7 @@ def extract_features(vx, vy, layer_type, ann_by_type, bldg_verts, site_median_z)
     ann_by_type    : dict[str, list[(x,y,z,type)]] — annotations split by type
     bldg_verts     : list[(x,y)] — building outline vertices
     site_median_z  : float — median Z of all terrain annotations for this project
+    rwall_segs     : list[((x1,y1),(x2,y2))] | None — retaining wall segments
     """
     enc = LAYER_ENC.get(layer_type, 1)
     feat = [
@@ -260,6 +396,7 @@ def extract_features(vx, vy, layer_type, ann_by_type, bldg_verts, site_median_z)
         1.0 if enc == 1 else 0.0,   # is_drive
         1.0 if enc == 2 else 0.0,   # is_road
     ]
+    all_spots = ann_by_type.get("SPOT", [])
     for at in ANN_TYPES:
         pairs = nearest_k(vx, vy, ann_by_type.get(at, []), N_NEAR, FEAT_RADIUS)
         for dist, z in pairs:
@@ -267,6 +404,11 @@ def extract_features(vx, vy, layer_type, ann_by_type, bldg_verts, site_median_z)
             feat.append(dist)
             feat.append(z_off)
     feat.append(nearest_building_dist(vx, vy, bldg_verts))
+    wd, wsame, wopp = wall_side_feature(vx, vy, rwall_segs or [], all_spots,
+                                        site_median_z)
+    feat.append(wd)
+    feat.append(wsame)
+    feat.append(wopp)
     return feat
 
 
@@ -312,6 +454,9 @@ def extract_pair(input_dxf_path, output_dxf_path, project_name="?"):
     # --- Collect building verts from input ---
     bldg_verts = collect_building_verts(in_msp)
 
+    # --- Collect retaining wall segments for wall-side feature ---
+    rwall_segs = collect_rwall_segments(in_msp)
+
     # --- Collect source line vertices to infer layer type at each output vertex ---
     src_line_verts = collect_input_line_verts(in_msp)  # (x, y, layer_type)
 
@@ -336,10 +481,17 @@ def extract_pair(input_dxf_path, output_dxf_path, project_name="?"):
     # two owned vertices) are excluded because training on them would teach
     # the model to reproduce linear interpolation rather than assignment logic.
     non_ffl_ann = [a for a in all_ann if a[3] != "FFL"]
+    # Fall back to FFL annotations for ownership when the project has no
+    # SPOT/DPC/L018 annotations (e.g. projects that only supply FFL levels).
+    # FFL points sit at building corners, often a little further from road
+    # polylines, so use a wider XY radius for this fallback.
+    ffl_only = not non_ffl_ann
+    ownership_ann = non_ffl_ann if non_ffl_ann else all_ann
+    xy_radius = OWNED_XY_RADIUS_FFL if ffl_only else OWNED_XY_RADIUS
 
     def is_owned(vx, vy, vz):
-        for ax, ay, az, _ in non_ffl_ann:
-            if math.sqrt((ax - vx) ** 2 + (ay - vy) ** 2) <= OWNED_XY_RADIUS:
+        for ax, ay, az, _ in ownership_ann:
+            if math.sqrt((ax - vx) ** 2 + (ay - vy) ** 2) <= xy_radius:
                 if abs(az - vz) <= OWNED_Z_TOL:
                     return True
         return False
@@ -350,7 +502,8 @@ def extract_pair(input_dxf_path, output_dxf_path, project_name="?"):
         if not is_owned(vx, vy, vz):
             continue
         lt = infer_layer_type(vx, vy)
-        feat = extract_features(vx, vy, lt, ann_by_type, bldg_verts, site_median)
+        feat = extract_features(vx, vy, lt, ann_by_type, bldg_verts, site_median,
+                                rwall_segs=rwall_segs)
         features.append(feat)
         targets.append(vz - site_median)
         n_owned += 1
@@ -492,7 +645,7 @@ def load_model(model_path=MODEL_PATH_DEFAULT):
 
 
 def predict_z_batch(verts_2d, layer_type, ann_by_type, bldg_verts, site_median_z,
-                    model_payload):
+                    model_payload, rwall_segs=None):
     """
     Predict Z for every vertex in verts_2d using the trained model.
 
@@ -504,6 +657,7 @@ def predict_z_batch(verts_2d, layer_type, ann_by_type, bldg_verts, site_median_z
     bldg_verts    : list of (x, y)
     site_median_z : float — median Z of all terrain annotations for this project
     model_payload : dict  — loaded via load_model()
+    rwall_segs    : list[((x1,y1),(x2,y2))] | None — retaining wall segments
 
     Returns
     -------
@@ -511,7 +665,8 @@ def predict_z_batch(verts_2d, layer_type, ann_by_type, bldg_verts, site_median_z
     """
     model = model_payload["model"]
     X = np.array([
-        extract_features(vx, vy, layer_type, ann_by_type, bldg_verts, site_median_z)
+        extract_features(vx, vy, layer_type, ann_by_type, bldg_verts, site_median_z,
+                         rwall_segs=rwall_segs)
         for vx, vy in verts_2d
     ], dtype=np.float32)
     z_offsets = model.predict(X)

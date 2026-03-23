@@ -53,11 +53,14 @@ POND_KEYWORDS   = ["pond", "water", "suds", "attenuation", "earthworks"]
 
 # Elevation text source layers — substring patterns (case-insensitive).
 # Multiple aliases per type handle different surveying firm conventions, e.g.:
-#   "LR SPOT LEVEL" / "5_E-Spot Levels" — both contain "SPOT LEVEL"
-#   "LR LLFA FFL"                        — contains "LLFA FFL"
-#   "5_E-Finished Floor Levels"           — contains "FINISHED FLOOR"
-SPOT_LEVEL_LAYERS = ["SPOT LEVEL", "L018 HA_ANN_FEAT_TEXT"]
-FFL_LAYERS        = ["LLFA FFL", "FINISHED FLOOR"]
+#   "LR SPOT LEVEL" / "5_E-Spot Levels"    — both contain "SPOT LEVEL"
+#   "LR LLFA FFL"                           — contains "LLFA FFL"
+#   "5_E-Finished Floor Levels"             — contains "FINISHED FLOOR"
+#   "REFA-EXT.W-Prop-Levels"               — contains "PROP-LEVELS"
+#   "REFA-EXT.W-Exist-Levels"              — contains "EXIST-LEVELS"
+#   "_REFA_ FFLs"                           — contains "FFL"
+SPOT_LEVEL_LAYERS = ["SPOT LEVEL", "L018 HA_ANN_FEAT_TEXT", "PROP-LEVELS", "EXIST-LEVELS", "EXT LEVEL", "EXTERNAL LEVEL", "PV LEVEL"]
+FFL_LAYERS        = ["LLFA FFL", "FINISHED FLOOR", "FFL"]
 DPC_LAYERS        = ["DPC LEVEL"]
 
 # Layers to EXCLUDE from the spot-only terrain point set used for 3D_LINES elevation.
@@ -183,15 +186,15 @@ def parse_elevation(text_value, is_ffl=False):
 
 
 def get_text_value(entity):
-    if entity.dxftype() == "TEXT":
-        return entity.dxf.text
     if entity.dxftype() == "MTEXT":
         return entity.plain_text()
+    if entity.dxftype() in ("TEXT", "ATTRIB"):
+        return entity.dxf.text
     return None
 
 
 def get_text_insertion(entity):
-    if entity.dxftype() in ("TEXT", "MTEXT"):
+    if entity.dxftype() in ("TEXT", "MTEXT", "ATTRIB"):
         pt = entity.dxf.insert
         return (pt.x, pt.y)
     return None
@@ -259,6 +262,13 @@ def collect_elevation_text(msp):
             for sub in iter_virtual_deep(entity):
                 if sub.dxftype() in ("TEXT", "MTEXT"):
                     process_text(sub)
+            # ATTRIBs are not yielded by virtual_entities(); they belong to
+            # the INSERT itself and store their position already in WCS.
+            try:
+                for att in entity.attribs:
+                    process_text(att)
+            except Exception:
+                pass
 
     return results
 
@@ -815,7 +825,8 @@ def elevate_line_geometry(segments, terrain_pts, tin=None,
                           search_radius=TERRAIN_SEARCH_RAD,
                           shared_assignment=False,
                           ml_payload=None, ann_by_type=None,
-                          bldg_verts_ml=None, site_median_z=None):
+                          bldg_verts_ml=None, site_median_z=None,
+                          rwall_segs_ml=None):
     """
     Assign Z to every vertex in every segment.
 
@@ -846,7 +857,8 @@ def elevate_line_geometry(segments, terrain_pts, tin=None,
                 # ML predictions for all vertices (cheap batch call)
                 z_preds = _ml_elevation.predict_z_batch(
                     verts_2d, layer_type, ann_by_type,
-                    bldg_verts_ml or [], site_median_z or 0.0, ml_payload
+                    bldg_verts_ml or [], site_median_z or 0.0, ml_payload,
+                    rwall_segs=rwall_segs_ml or [],
                 )
                 # Phase 1 seeds: only use ML Z for vertices near terrain
                 z_precomputed = [z_preds[i] if near_mask[i] else None
@@ -1627,23 +1639,30 @@ def run_pipeline(input_path, output_path):
     _ml_payload = None
     _ann_by_type = None
     _bldg_verts_ml = None
+    _rwall_segs_ml = None
     _site_median_z = None
     if _HAS_ML:
         _ml_payload = _ml_elevation.load_model()
         if _ml_payload:
-            # Build annotation dict for ML feature extraction (same format as ml_elevation)
+            # Build annotation dict for ML feature extraction (same format as ml_elevation).
+            # Use the same substring patterns as ml_elevation so all surveying firms match.
+            _spot_kw = [s.upper() for s in _ml_elevation.SPOT_LAYERS]
+            _dpc_kw  = [s.upper() for s in _ml_elevation.DPC_LAYERS]
+            _l018_kw = [s.upper() for s in _ml_elevation.L018_LAYERS]
+            _ffl_kw  = [s.upper() for s in _ml_elevation.FFL_LAYERS]
             _ann_by_type = {"SPOT": [], "DPC": [], "L018": [], "FFL": []}
             for xy, elev, layer, is_ffl, is_dpc in elevation_data:
                 lu = layer.upper()
-                if "LR SPOT LEVEL" in lu:
+                if any(kw in lu for kw in _spot_kw):
                     _ann_by_type["SPOT"].append((xy[0], xy[1], elev, "SPOT"))
-                elif "LR DPC LEVEL" in lu:
+                elif any(kw in lu for kw in _dpc_kw):
                     _ann_by_type["DPC"].append((xy[0], xy[1], elev, "DPC"))
-                elif "L018 HA_ANN_FEAT_TEXT" in lu:
+                elif any(kw in lu for kw in _l018_kw):
                     _ann_by_type["L018"].append((xy[0], xy[1], elev, "L018"))
-                elif "LR LLFA FFL" in lu:
+                elif any(kw in lu for kw in _ffl_kw):
                     _ann_by_type["FFL"].append((xy[0], xy[1], elev, "FFL"))
             _bldg_verts_ml = _ml_elevation.collect_building_verts(msp)
+            _rwall_segs_ml = _ml_elevation.collect_rwall_segments(msp)
             all_z = [elev for _, elev, _, _, _ in elevation_data]
             if all_z:
                 sorted_z = sorted(all_z)
@@ -1669,6 +1688,7 @@ def run_pipeline(input_path, output_path):
         segs, spot_terrain_pts, tin=tin,
         ml_payload=_ml_payload, ann_by_type=_ann_by_type,
         bldg_verts_ml=_bldg_verts_ml, site_median_z=_site_median_z,
+        rwall_segs_ml=_rwall_segs_ml,
     )
     print(f"  {len(line_polys_3d)} 3D_LINES polylines\n")
 
