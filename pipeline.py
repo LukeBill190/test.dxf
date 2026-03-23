@@ -59,7 +59,7 @@ POND_KEYWORDS   = ["pond", "water", "suds", "attenuation", "earthworks"]
 #   "REFA-EXT.W-Prop-Levels"               — contains "PROP-LEVELS"
 #   "REFA-EXT.W-Exist-Levels"              — contains "EXIST-LEVELS"
 #   "_REFA_ FFLs"                           — contains "FFL"
-SPOT_LEVEL_LAYERS = ["SPOT LEVEL", "L018 HA_ANN_FEAT_TEXT", "PROP-LEVELS", "EXIST-LEVELS", "EXT LEVEL"]
+SPOT_LEVEL_LAYERS = ["SPOT LEVEL", "L018 HA_ANN_FEAT_TEXT", "PROP-LEVELS", "EXIST-LEVELS", "EXT LEVEL", "EXTERNAL LEVEL", "PV LEVEL"]
 FFL_LAYERS        = ["LLFA FFL", "FINISHED FLOOR", "FFL"]
 DPC_LAYERS        = ["DPC LEVEL"]
 
@@ -186,15 +186,15 @@ def parse_elevation(text_value, is_ffl=False):
 
 
 def get_text_value(entity):
-    if entity.dxftype() == "TEXT":
-        return entity.dxf.text
     if entity.dxftype() == "MTEXT":
         return entity.plain_text()
+    if entity.dxftype() in ("TEXT", "ATTRIB"):
+        return entity.dxf.text
     return None
 
 
 def get_text_insertion(entity):
-    if entity.dxftype() in ("TEXT", "MTEXT"):
+    if entity.dxftype() in ("TEXT", "MTEXT", "ATTRIB"):
         pt = entity.dxf.insert
         return (pt.x, pt.y)
     return None
@@ -262,6 +262,13 @@ def collect_elevation_text(msp):
             for sub in iter_virtual_deep(entity):
                 if sub.dxftype() in ("TEXT", "MTEXT"):
                     process_text(sub)
+            # ATTRIBs are not yielded by virtual_entities(); they belong to
+            # the INSERT itself and store their position already in WCS.
+            try:
+                for att in entity.attribs:
+                    process_text(att)
+            except Exception:
+                pass
 
     return results
 

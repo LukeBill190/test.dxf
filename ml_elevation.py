@@ -49,7 +49,7 @@ import numpy as np
 # Multiple aliases per type handle different surveying firm conventions, e.g.:
 #   "LR SPOT LEVEL"         (standard)
 #   "5_E-Spot Levels"       (alternate firm convention)
-SPOT_LAYERS  = ["SPOT LEVEL", "PROP-LEVELS", "EXIST-LEVELS", "PROPOSED LEVEL", "EXT LEVEL"]  # matches "LR SPOT LEVEL", "REFA-EXT.W-Prop-Levels", "OEC-Ext Wks - Proposed Levels", "_ENG_Ext Levels", etc.
+SPOT_LAYERS  = ["SPOT LEVEL", "PROP-LEVELS", "EXIST-LEVELS", "PROPOSED LEVEL", "EXT LEVEL", "EXTERNAL LEVEL", "PV LEVEL"]  # matches "LR SPOT LEVEL", "REFA-EXT.W-Prop-Levels", "OEC-Ext Wks - Proposed Levels", "_ENG_Ext Levels", "-m-ec_external levels", "PV LEVEL" (attrib block), etc.
 DPC_LAYERS   = ["DPC LEVEL", "DPC"]                           # matches "LR DPC LEVEL"
 L018_LAYERS  = ["L018 HA_ANN_FEAT_TEXT"]
 FFL_LAYERS   = ["LLFA FFL", "FINISHED FLOOR", "FFL LEVEL", "FFL"]  # matches "LR LLFA FFL", "_REFA_ FFLs", etc.
@@ -73,8 +73,9 @@ FEAT_RADIUS = 20.0
 MIN_OWNED_VERTS = 30
 # A vertex is "directly owned" (not interpolated) if its Z matches a terrain
 # annotation within this distance and Z tolerance.
-OWNED_XY_RADIUS  = 2.0   # metres
-OWNED_Z_TOL      = 0.012  # 12 mm
+OWNED_XY_RADIUS      = 2.0   # metres — for SPOT/DPC/L018 annotations
+OWNED_XY_RADIUS_FFL  = 3.0   # metres — wider fallback when only FFL annotations exist
+OWNED_Z_TOL          = 0.012  # 12 mm
 
 MODEL_PATH_DEFAULT = Path(__file__).parent / "elevation_model.pkl"
 DATA_DIR_DEFAULT   = Path(__file__).parent / "training_data"
@@ -132,14 +133,14 @@ def collect_annotations(msp):
     annotations = []
 
     def _try_text(ent):
-        if ent.dxftype() not in ("TEXT", "MTEXT"):
+        if ent.dxftype() not in ("TEXT", "MTEXT", "ATTRIB"):
             return
         try:
             xy = (ent.dxf.insert.x, ent.dxf.insert.y)
         except Exception:
             return
         try:
-            txt = ent.dxf.text if ent.dxftype() == "TEXT" else ent.text
+            txt = ent.text if ent.dxftype() == "MTEXT" else ent.dxf.text
         except Exception:
             return
         z = _parse_z(txt)
@@ -160,6 +161,13 @@ def collect_annotations(msp):
         elif ent.dxftype() == "INSERT":
             for sub in _iter_virtual_deep(ent):
                 _try_text(sub)
+            # ATTRIBs are not yielded by virtual_entities(); they belong to
+            # the INSERT itself and store their position already in WCS.
+            try:
+                for att in ent.attribs:
+                    _try_text(att)
+            except Exception:
+                pass
 
     return annotations
 
@@ -473,10 +481,17 @@ def extract_pair(input_dxf_path, output_dxf_path, project_name="?"):
     # two owned vertices) are excluded because training on them would teach
     # the model to reproduce linear interpolation rather than assignment logic.
     non_ffl_ann = [a for a in all_ann if a[3] != "FFL"]
+    # Fall back to FFL annotations for ownership when the project has no
+    # SPOT/DPC/L018 annotations (e.g. projects that only supply FFL levels).
+    # FFL points sit at building corners, often a little further from road
+    # polylines, so use a wider XY radius for this fallback.
+    ffl_only = not non_ffl_ann
+    ownership_ann = non_ffl_ann if non_ffl_ann else all_ann
+    xy_radius = OWNED_XY_RADIUS_FFL if ffl_only else OWNED_XY_RADIUS
 
     def is_owned(vx, vy, vz):
-        for ax, ay, az, _ in non_ffl_ann:
-            if math.sqrt((ax - vx) ** 2 + (ay - vy) ** 2) <= OWNED_XY_RADIUS:
+        for ax, ay, az, _ in ownership_ann:
+            if math.sqrt((ax - vx) ** 2 + (ay - vy) ** 2) <= xy_radius:
                 if abs(az - vz) <= OWNED_Z_TOL:
                     return True
         return False
