@@ -49,7 +49,7 @@ import numpy as np
 # Multiple aliases per type handle different surveying firm conventions, e.g.:
 #   "LR SPOT LEVEL"         (standard)
 #   "5_E-Spot Levels"       (alternate firm convention)
-SPOT_LAYERS  = ["SPOT LEVEL", "PROP-LEVELS", "EXIST-LEVELS", "PROPOSED LEVEL"]  # matches "LR SPOT LEVEL", "REFA-EXT.W-Prop-Levels", "OEC-Ext Wks - Proposed Levels", etc.
+SPOT_LAYERS  = ["SPOT LEVEL", "PROP-LEVELS", "EXIST-LEVELS", "PROPOSED LEVEL", "EXT LEVEL"]  # matches "LR SPOT LEVEL", "REFA-EXT.W-Prop-Levels", "OEC-Ext Wks - Proposed Levels", "_ENG_Ext Levels", etc.
 DPC_LAYERS   = ["DPC LEVEL", "DPC"]                           # matches "LR DPC LEVEL"
 L018_LAYERS  = ["L018 HA_ANN_FEAT_TEXT"]
 FFL_LAYERS   = ["LLFA FFL", "FINISHED FLOOR", "FFL LEVEL", "FFL"]  # matches "LR LLFA FFL", "_REFA_ FFLs", etc.
@@ -106,30 +106,61 @@ def _parse_z(text):
     return float(nums[0]) if nums else None
 
 
+def _iter_virtual_deep(insert_entity, max_depth=6):
+    """Yield all virtual entities from a nested INSERT, recursively.
+    ezdxf's virtual_entities() applies the INSERT transform so returned
+    entities are in world coordinates."""
+    if max_depth <= 0:
+        return
+    try:
+        for sub in insert_entity.virtual_entities():
+            yield sub
+            if sub.dxftype() == "INSERT":
+                yield from _iter_virtual_deep(sub, max_depth - 1)
+    except Exception:
+        pass
+
+
 def collect_annotations(msp):
-    """Return list of (x, y, z, ann_type) for all elevation text in modelspace."""
+    """Return list of (x, y, z, ann_type) for all elevation text in modelspace.
+
+    Also bursts INSERT (block) entities so that TEXT/MTEXT carried inside
+    block definitions — with their attribute values — are included at their
+    correct world coordinates.  This handles surveying conventions where firms
+    group level annotations inside a named block inserted once at the origin.
+    """
     annotations = []
-    for ent in msp:
+
+    def _try_text(ent):
         if ent.dxftype() not in ("TEXT", "MTEXT"):
-            continue
+            return
         try:
             xy = (ent.dxf.insert.x, ent.dxf.insert.y)
         except Exception:
-            continue
+            return
         try:
             txt = ent.dxf.text if ent.dxftype() == "TEXT" else ent.text
         except Exception:
-            continue
+            return
         z = _parse_z(txt)
         if z is None:
-            continue
+            return
         layer = ent.dxf.layer
         if   any(s.upper() in layer.upper() for s in SPOT_LAYERS):  ann_type = "SPOT"
         elif any(s.upper() in layer.upper() for s in DPC_LAYERS):   ann_type = "DPC"
         elif any(s.upper() in layer.upper() for s in L018_LAYERS):  ann_type = "L018"
         elif any(s.upper() in layer.upper() for s in FFL_LAYERS):   ann_type = "FFL"
-        else: continue
+        else:
+            return
         annotations.append((xy[0], xy[1], z, ann_type))
+
+    for ent in msp:
+        if ent.dxftype() in ("TEXT", "MTEXT"):
+            _try_text(ent)
+        elif ent.dxftype() == "INSERT":
+            for sub in _iter_virtual_deep(ent):
+                _try_text(sub)
+
     return annotations
 
 
