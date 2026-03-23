@@ -102,6 +102,22 @@ ARC_CHORD_MAX = 0.1
 # matches the reference model (which has vertices ~ every 1 m along polylines).
 MAX_VERTEX_SPACING = 1.0
 
+# Geometric building outline detection parameters.
+# Used when keyword-based layer matching finds no outlines (e.g. projects where
+# house types are on firm-specific or house-type-named layers).
+GEOM_DETECT_FFL_RADIUS = 25.0   # metres: search radius around each FFL annotation
+GEOM_DETECT_MIN_AREA   = 15.0   # m²: smallest plausible house footprint
+GEOM_DETECT_MAX_AREA   = 800.0  # m²: largest single-building footprint
+
+# Layer substrings that identify annotation / non-geometry layers — these are
+# excluded from the geometric candidate scan so text and hatch entities don't
+# pollute the closed-polygon list.
+GEOM_EXCLUDE_LAYERS = [
+    "SPOT LEVEL", "PROP-LEVELS", "EXIST-LEVELS", "EXT LEVEL", "EXTERNAL LEVEL",
+    "PV LEVEL", "DPC LEVEL", "DPC", "L018", "LLFA FFL", "FINISHED FLOOR",
+    "FFL LEVEL", "HATCH", "DEFPOINTS", "ANNO", "DIMENSION", "CHAINAGE",
+]
+
 # ML elevation model (loaded at runtime if elevation_model.pkl exists)
 try:
     import ml_elevation as _ml_elevation
@@ -1139,6 +1155,360 @@ def _block_outline_verts(doc, insert_entity):
     return inner_results, outer_results
 
 
+def _geom_exclude(layer_name):
+    """True if this layer should be skipped during geometric candidate collection."""
+    lu = layer_name.upper()
+    return any(kw.upper() in lu for kw in GEOM_EXCLUDE_LAYERS)
+
+
+def collect_closed_poly_candidates(msp, doc):
+    """
+    Collect ALL closed / near-closed polygons from modelspace and INSERT blocks,
+    from any layer, as candidates for building outline detection.
+
+    Excludes annotation layers (GEOM_EXCLUDE_LAYERS) and polygons whose area
+    falls outside the plausible house footprint range
+    (GEOM_DETECT_MIN_AREA … GEOM_DETECT_MAX_AREA).
+
+    Returns list of (verts_2d, layer_name, area_m2).
+    """
+    candidates = []
+    seen = set()
+
+    def _ckey(verts):
+        cx = round(sum(v[0] for v in verts) / len(verts), 1)
+        cy = round(sum(v[1] for v in verts) / len(verts), 1)
+        return (cx, cy)
+
+    def _try_add(verts, layer):
+        if len(verts) < 4:
+            return
+        if dist_2d(verts[0], verts[-1]) > CHAIN_SNAP_TOL * 2:
+            return
+        try:
+            poly = Polygon(verts)
+            if not poly.is_valid:
+                poly = poly.buffer(0)
+            area = poly.area
+        except Exception:
+            return
+        if area < GEOM_DETECT_MIN_AREA or area > GEOM_DETECT_MAX_AREA:
+            return
+        k = _ckey(verts)
+        if k not in seen:
+            seen.add(k)
+            candidates.append((verts, layer, area))
+
+    # ----------------------------------------------------------------
+    # Block geometry cache — process each unique block definition ONCE,
+    # then apply the affine transform per INSERT.  This avoids calling
+    # virtual_entities() thousands of times for drawings with many
+    # repeated house-type blocks (project_006: 2229 inserts, 191 FFL).
+    # ----------------------------------------------------------------
+    _block_poly_cache = {}   # block_name → list of (verts_local, layer)
+
+    def _block_closed_polys(block_name, depth=0):
+        """
+        Return list of (verts_in_block_coords, layer) closed polygons
+        for the named block definition.  Results are cached.
+        """
+        if block_name in _block_poly_cache:
+            return _block_poly_cache[block_name]
+        if depth > 4:
+            _block_poly_cache[block_name] = []
+            return []
+        try:
+            blk = doc.blocks.get(block_name)
+        except Exception:
+            blk = None
+        if blk is None:
+            _block_poly_cache[block_name] = []
+            return []
+
+        polys = []
+        local_segs = defaultdict(list)
+
+        for sub in blk:
+            try:
+                layer = sub.dxf.layer
+            except Exception:
+                continue
+            if _geom_exclude(layer):
+                continue
+
+            if sub.dxftype() == "LWPOLYLINE":
+                try:
+                    pts = [(x, y) for x, y, *_ in sub.get_points()]
+                except Exception:
+                    continue
+                if len(pts) < 3:
+                    continue
+                is_closed = sub.closed or dist_2d(pts[0], pts[-1]) < CHAIN_SNAP_TOL * 2
+                if is_closed:
+                    ring = pts if dist_2d(pts[0], pts[-1]) < 1e-6 else pts + [pts[0]]
+                    polys.append((ring, layer))
+
+            elif sub.dxftype() == "LINE":
+                try:
+                    s, e = sub.dxf.start, sub.dxf.end
+                    local_segs[layer].append(((s.x, s.y), (e.x, e.y)))
+                except Exception:
+                    continue
+
+            elif sub.dxftype() == "INSERT":
+                # Nested INSERT: transform child geometry into this block's space
+                try:
+                    csx = sub.dxf.get("xscale", 1.0)
+                    csy = sub.dxf.get("yscale", 1.0)
+                    crot = sub.dxf.get("rotation", 0.0)
+                    ctx, cty = sub.dxf.insert.x, sub.dxf.insert.y
+                except Exception:
+                    continue
+                for child_verts, child_layer in _block_closed_polys(sub.dxf.name, depth + 1):
+                    xf = [_apply_insert_xform(x, y, ctx, cty, csx, csy, crot)
+                          for x, y in child_verts]
+                    polys.append((xf, child_layer))
+
+        for layer, segs in local_segs.items():
+            for chain in _chain_lines_to_outlines(segs, snap_tol=CHAIN_SNAP_TOL):
+                polys.append((chain, layer))
+
+        _block_poly_cache[block_name] = polys
+        return polys
+
+    # ----------------------------------------------------------------
+    # Pass 1: direct modelspace entities
+    # ----------------------------------------------------------------
+    direct_line_segs = defaultdict(list)
+
+    for entity in msp:
+        if entity.dxftype() == "LWPOLYLINE":
+            if _geom_exclude(entity.dxf.layer):
+                continue
+            pts = [(x, y) for x, y, *_ in entity.get_points()]
+            if len(pts) < 3:
+                continue
+            is_closed = entity.closed or dist_2d(pts[0], pts[-1]) < CHAIN_SNAP_TOL * 2
+            if is_closed:
+                ring = pts if dist_2d(pts[0], pts[-1]) < 1e-6 else pts + [pts[0]]
+                _try_add(ring, entity.dxf.layer)
+
+        elif entity.dxftype() == "LINE":
+            if not _geom_exclude(entity.dxf.layer):
+                s, e = entity.dxf.start, entity.dxf.end
+                direct_line_segs[entity.dxf.layer].append(((s.x, s.y), (e.x, e.y)))
+
+        elif entity.dxftype() == "INSERT":
+            # Apply INSERT's world transform to each cached local polygon
+            try:
+                sx = entity.dxf.get("xscale", 1.0)
+                sy = entity.dxf.get("yscale", 1.0)
+                rot = entity.dxf.get("rotation", 0.0)
+                tx, ty = entity.dxf.insert.x, entity.dxf.insert.y
+            except Exception:
+                continue
+            for local_verts, layer in _block_closed_polys(entity.dxf.name):
+                world_verts = [_apply_insert_xform(x, y, tx, ty, sx, sy, rot)
+                               for x, y in local_verts]
+                _try_add(world_verts, layer)
+
+    # Chain direct LINE segments (layer-by-layer) into closed polygons
+    for layer, segs in direct_line_segs.items():
+        for chain in _chain_lines_to_outlines(segs, snap_tol=CHAIN_SNAP_TOL):
+            _try_add(chain, layer)
+
+    return candidates
+
+
+def select_building_outlines_geometric(ffl_annotations, candidates):
+    """
+    For each FFL annotation find the single best candidate closed polygon and
+    return it as a building outline.
+
+    Scoring strategy — for each FFL point we want the most specific (smallest)
+    closed polygon that either *contains* the FFL or is very close to it:
+
+        score = (GEOM_DETECT_MAX_AREA − area) − dist_to_ffl × 10
+
+    A polygon that contains the FFL gets dist = 0, so it is strongly preferred
+    over larger surrounding polygons (e.g. plot boundaries).  Among containing
+    polygons the smallest area wins, which avoids picking a large site/plot
+    boundary polygon over the actual house footprint.
+
+    Duplicate polygons (same building detected by multiple nearby FFL
+    annotations) are suppressed by centroid proximity (< 2 m).
+
+    Returns list of (verts, layer_name) suitable for appending to outer_outlines.
+    """
+    results = []
+    used_centroids = set()
+
+    # Pre-compute Shapely polygons once so the inner FFL loop only calls
+    # .contains() / .distance() rather than reconstructing polygons each time.
+    prebuilt = []
+    for verts, layer, area in candidates:
+        try:
+            poly = Polygon(verts)
+            if not poly.is_valid:
+                poly = poly.buffer(0)
+            prebuilt.append((poly, verts, layer, area))
+        except Exception:
+            continue
+
+    for (fx, fy), _ffl_val in ffl_annotations:
+        ffl_pt = Point(fx, fy)
+
+        best_score  = None
+        best_verts  = None
+        best_layer  = None
+
+        for poly, verts, layer, area in prebuilt:
+            try:
+                if poly.contains(ffl_pt):
+                    dist = 0.0
+                else:
+                    dist = poly.distance(ffl_pt)
+                    if dist > GEOM_DETECT_FFL_RADIUS:
+                        continue
+
+                # Prefer smallest polygon closest to FFL
+                score = (GEOM_DETECT_MAX_AREA - area) - dist * 10.0
+
+                if best_score is None or score > best_score:
+                    best_score = score
+                    best_verts = verts
+                    best_layer = layer
+            except Exception:
+                continue
+
+        if best_verts is None:
+            continue
+
+        # Deduplicate: skip if a polygon with the same centroid was already added
+        cx = round(sum(v[0] for v in best_verts) / len(best_verts), 1)
+        cy = round(sum(v[1] for v in best_verts) / len(best_verts), 1)
+        if (cx, cy) not in used_centroids:
+            used_centroids.add((cx, cy))
+            results.append((best_verts, best_layer))
+
+    return results
+
+
+def collect_morphological_building_outlines(msp, ffl_annotations):
+    """
+    Morphological building outline detection — used when no pre-formed closed
+    polygons are found near FFL annotations.
+
+    For each FFL annotation the algorithm:
+      1. Collects all nearby LINE segments on non-annotation layers
+         (within MORPH_SEARCH_RADIUS metres).
+      2. Dilates each segment by MORPH_WALL_HALF (half a typical wall thickness)
+         and unions the results into a single 'building mass' blob.
+      3. Extracts the individual connected polygon(s) and selects the one that
+         most closely matches the FFL point (smallest qualifying polygon that
+         contains or is nearest to the FFL).
+
+    This naturally finds the external footprint of houses where all internal
+    geometry (rooms, windows, walls) shares one layer — the outer boundary of
+    the unioned blob is the external wall face.
+
+    Returns list of (verts, layer_name).
+    """
+    MORPH_SEARCH_RADIUS = 15.0   # metres — line collection radius per FFL
+    MORPH_WALL_HALF     = 0.35   # metres — dilation half-thickness
+
+    results = []
+    used_centroids = set()
+
+    # Pre-collect ALL non-annotation LINE segments from modelspace (with XY only)
+    all_segs = []   # (layer, x1, y1, x2, y2)
+    for entity in msp:
+        if entity.dxftype() != "LINE":
+            continue
+        if _geom_exclude(entity.dxf.layer):
+            continue
+        s, e = entity.dxf.start, entity.dxf.end
+        all_segs.append((entity.dxf.layer, s.x, s.y, e.x, e.y))
+
+    if not all_segs:
+        return results
+
+    # Vectorised Voronoi assignment — compute all (seg_midpoint → FFL) distances
+    # in one numpy matrix operation so we avoid an O(n_segs × n_ffls) Python loop.
+    import numpy as _np
+    mid_arr = _np.array([((x1 + x2) / 2, (y1 + y2) / 2)
+                         for _, x1, y1, x2, y2 in all_segs], dtype=_np.float64)
+    ffl_arr = _np.array([list(xy) for xy, _ in ffl_annotations], dtype=_np.float64)
+
+    # dist_mat[i, j] = distance from segment-i midpoint to FFL-j
+    diff = mid_arr[:, None, :] - ffl_arr[None, :, :]          # (n_segs, n_ffls, 2)
+    dist_mat = _np.sqrt((diff ** 2).sum(axis=2))               # (n_segs, n_ffls)
+
+    # For each segment, the index of the nearest FFL
+    nearest_ffl_idx = dist_mat.argmin(axis=1)                  # (n_segs,)
+
+    for fi, ((fx, fy), _ffl_val) in enumerate(ffl_annotations):
+        # Voronoi: segments whose nearest FFL is THIS one, within MORPH_SEARCH_RADIUS
+        mask = (nearest_ffl_idx == fi) & (dist_mat[:, fi] < MORPH_SEARCH_RADIUS)
+        nearby = [
+            (all_segs[si][1], all_segs[si][2], all_segs[si][3], all_segs[si][4])
+            for si in _np.where(mask)[0]
+        ]
+
+        if len(nearby) < 8:
+            continue
+
+        try:
+            from shapely.geometry import LineString as _LS
+            dilated = [
+                _LS([(x1, y1), (x2, y2)]).buffer(MORPH_WALL_HALF, cap_style=2, join_style=2)
+                for x1, y1, x2, y2 in nearby
+            ]
+            blob = unary_union(dilated)
+            # Slight erosion to separate touching blobs and clean artefacts
+            blob = blob.buffer(-MORPH_WALL_HALF * 0.3)
+
+            if blob.is_empty:
+                continue
+
+            geoms = list(blob.geoms) if blob.geom_type == "MultiPolygon" else [blob]
+            ffl_pt = Point(fx, fy)
+
+            best_poly = None
+            best_score = None
+            for geom in geoms:
+                if geom.geom_type != "Polygon":
+                    continue
+                area = geom.area
+                if area < GEOM_DETECT_MIN_AREA or area > GEOM_DETECT_MAX_AREA:
+                    continue
+                if geom.contains(ffl_pt):
+                    dist = 0.0
+                else:
+                    dist = geom.distance(ffl_pt)
+                    if dist > GEOM_DETECT_FFL_RADIUS:
+                        continue
+                score = (GEOM_DETECT_MAX_AREA - area) - dist * 10.0
+                if best_score is None or score > best_score:
+                    best_score = score
+                    best_poly = geom
+
+            if best_poly is None:
+                continue
+
+            verts = list(best_poly.exterior.coords)
+            cx = round(sum(v[0] for v in verts) / len(verts), 1)
+            cy = round(sum(v[1] for v in verts) / len(verts), 1)
+            if (cx, cy) not in used_centroids:
+                used_centroids.add((cx, cy))
+                results.append((verts, "GEOM_MORPH"))
+
+        except Exception:
+            continue
+
+    return results
+
+
 def collect_building_outlines(msp, doc):
     """
     Collect building plot outlines from both PLOT OUTLINE INNER and H-EXTERNAL WALL.
@@ -1695,7 +2065,63 @@ def run_pipeline(input_path, output_path):
     # ── Building pads ─────────────────────────────────────────────────────────
     print("[6/8] Collecting building outlines...")
     inner_outlines, outer_outlines = collect_building_outlines(msp, doc)
-    print(f"  {len(inner_outlines)} inner (H-PLOT OUTLINE INNER), {len(outer_outlines)} outer (H-EXTERNAL WALL)\n")
+    print(f"  {len(inner_outlines)} inner (H-PLOT OUTLINE INNER), {len(outer_outlines)} outer (H-EXTERNAL WALL)")
+
+    # Geometric fallback — scan ALL closed polygons near FFL annotations.
+    # Runs on every project; results are only used for FFL annotations not already
+    # covered by the keyword-based detection above (dedup by centroid proximity).
+    geo_candidates = collect_closed_poly_candidates(msp, doc)
+    geo_outlines   = select_building_outlines_geometric(ffl_data, geo_candidates)
+    existing_verts = [(v, l) for v, l in inner_outlines + outer_outlines]
+    n_geo_added    = 0
+    for verts, layer in geo_outlines:
+        cx = sum(v[0] for v in verts) / len(verts)
+        cy = sum(v[1] for v in verts) / len(verts)
+        already_covered = any(
+            math.sqrt((cx - sum(v[0] for v in kv) / len(kv)) ** 2 +
+                      (cy - sum(v[1] for v in kv) / len(kv)) ** 2) < 2.0
+            for kv, _ in existing_verts
+        )
+        if not already_covered:
+            outer_outlines.append((verts, layer))
+            existing_verts.append((verts, layer))
+            n_geo_added += 1
+    if n_geo_added:
+        print(f"  +{n_geo_added} geometrically-detected outline(s) (layer-name-agnostic fallback)")
+
+    # Morphological fallback — used when the closed-polygon scan above still
+    # leaves FFL annotations uncovered (e.g. where all house geometry shares one
+    # layer and the external outline is not a single pre-formed closed polygon).
+    # We dilate+union nearby LINE segments to reconstruct the building mass.
+    uncovered_ffls = []
+    for (fx, fy), ffl_val in ffl_data:
+        ffl_pt = Point(fx, fy)
+        covered = any(
+            Polygon(v).contains(ffl_pt) or Polygon(v).distance(ffl_pt) < 3.0
+            for v, _ in existing_verts
+            if len(v) >= 3
+        )
+        if not covered:
+            uncovered_ffls.append(((fx, fy), ffl_val))
+
+    if uncovered_ffls:
+        morph_outlines = collect_morphological_building_outlines(msp, uncovered_ffls)
+        n_morph = 0
+        for verts, layer in morph_outlines:
+            cx = sum(v[0] for v in verts) / len(verts)
+            cy = sum(v[1] for v in verts) / len(verts)
+            dup = any(
+                math.sqrt((cx - sum(v[0] for v in kv) / len(kv)) ** 2 +
+                          (cy - sum(v[1] for v in kv) / len(kv)) ** 2) < 2.0
+                for kv, _ in existing_verts
+            )
+            if not dup:
+                outer_outlines.append((verts, layer))
+                existing_verts.append((verts, layer))
+                n_morph += 1
+        if n_morph:
+            print(f"  +{n_morph} morphologically-detected outline(s) (buffer+union fallback)")
+    print()
 
     print("[7/8] Merging adjacent same-FFL plots, generating pad polylines...")
     merged_pads = assign_ffl_and_merge(inner_outlines, ffl_data, outer_outlines=outer_outlines)
