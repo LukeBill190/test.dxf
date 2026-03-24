@@ -42,6 +42,9 @@ except ImportError:
 # entities from 3D_LINES, not as a source of plot outline geometry.
 BUILDING_OUTLINE_LAYERS = ["PLOT OUTLINE INNER"]   # source for pad geometry only (inner face)
 OUTER_WALL_LAYER        = "H-EXTERNAL WALL"        # outer wall face — used directly where available
+# Additional outer-wall layer substrings for projects that use Revit/Xref-style naming
+# (case-insensitive substring match, same as OUTER_WALL_LAYER).
+EXTRA_OUTER_WALL_LAYERS = ["RfPl-Wall_Outline"]
 BUILDING_KEYWORDS       = ["plot", "building", "house", "garage"]
 BUILDING_SUPPRESS_LAYERS = ["EXTERNAL PARTY WALL"]  # exclude from 3D_LINES but not pads
 
@@ -142,6 +145,14 @@ def _is_pad_source_layer(layer_name):
         if pat.upper() in lu:
             return True
     return False
+
+
+def _is_outer_wall_layer(layer_name):
+    """True if this layer contains outer wall face geometry (H-EXTERNAL WALL or Revit-style equivalents)."""
+    lu = layer_name.upper()
+    if OUTER_WALL_LAYER.upper() in lu:
+        return True
+    return any(pat.upper() in lu for pat in EXTRA_OUTER_WALL_LAYERS)
 
 
 def _classify_layer_ml(layer_name):
@@ -1033,7 +1044,7 @@ def _block_outline_verts(doc, insert_entity):
                 lyr = ""
 
             is_inner  = _is_pad_source_layer(lyr)
-            is_outer  = OUTER_WALL_LAYER.upper() in lyr.upper()
+            is_outer  = _is_outer_wall_layer(lyr)
             is_party352 = ("EXTERNAL PARTY WALL 352" in lyr.upper())
             # H-EXTERNAL PARTY WALL (non-352) LINEs close the outline for MID inner blocks
             is_party  = ("EXTERNAL PARTY WALL" in lyr.upper()
@@ -1552,7 +1563,7 @@ def collect_building_outlines(msp, doc):
         lyr = entity.dxf.layer
         if _is_pad_source_layer(lyr):
             add_inner([(x, y) for x, y, *_ in entity.get_points()], lyr)
-        elif OUTER_WALL_LAYER.upper() in lyr.upper():
+        elif _is_outer_wall_layer(lyr):
             add_outer([(x, y) for x, y, *_ in entity.get_points()], lyr)
 
     # Geometry inside INSERT blocks
@@ -1564,6 +1575,75 @@ def collect_building_outlines(msp, doc):
             add_inner(verts, BUILDING_OUTLINE_LAYERS[0])
         for verts in outer_verts_list:
             add_outer(verts, OUTER_WALL_LAYER)
+
+    # Position-grouped LINE segment collection.
+    # Some projects (e.g. Revit Xref exports) split a building outline across
+    # two co-located INSERT blocks (e.g. "AS-Sold" + "Optional" variants at the
+    # same XY position).  Neither block's LINE segments form a closed ring on
+    # their own, but combining all segments from inserts at the same position
+    # does.  We collect outer-wall LINE segments (any _is_outer_wall_layer),
+    # group them by INSERT position (rounded to nearest metre), chain each
+    # group, and add any resulting closed outlines.
+    #
+    # Block-local LINE segments are cached so repeated instances of the same
+    # block definition are only scanned once (important for projects with
+    # thousands of identical inserts, e.g. project_006 with ~2229 inserts).
+    _blk_line_cache = {}   # block_name → list of (bx1,by1, bx2,by2) local coords
+
+    def _outer_lines_for_block(blk_name):
+        """Return local-coord LINE segments on EXTRA_OUTER_WALL_LAYERS only.
+
+        H-EXTERNAL WALL is already handled per-INSERT by _block_outline_verts;
+        we only need the extra layers here (e.g. RfPl-Wall_Outline) so that
+        projects using H-EXTERNAL WALL don't incur unnecessary work.
+        """
+        if blk_name in _blk_line_cache:
+            return _blk_line_cache[blk_name]
+        blk = doc.blocks.get(blk_name)
+        segs = []
+        if blk is not None:
+            for sub in blk:
+                try:
+                    lyr = sub.dxf.layer
+                except Exception:
+                    continue
+                if sub.dxftype() != "LINE":
+                    continue
+                lu = lyr.upper()
+                if not any(pat.upper() in lu for pat in EXTRA_OUTER_WALL_LAYERS):
+                    continue
+                try:
+                    s, e = sub.dxf.start, sub.dxf.end
+                    segs.append((s.x, s.y, e.x, e.y))
+                except Exception:
+                    continue
+        _blk_line_cache[blk_name] = segs
+        return segs
+
+    pos_segs = defaultdict(list)
+    for entity in msp:
+        if entity.dxftype() != "INSERT":
+            continue
+        local_lines = _outer_lines_for_block(entity.dxf.name)
+        if not local_lines:
+            continue
+        try:
+            sx  = entity.dxf.get("xscale", 1.0)
+            sy  = entity.dxf.get("yscale", 1.0)
+            rot = entity.dxf.get("rotation", 0.0)
+            tx, ty = entity.dxf.insert.x, entity.dxf.insert.y
+        except Exception:
+            continue
+        pos_key = (round(tx, 0), round(ty, 0))
+        for bx1, by1, bx2, by2 in local_lines:
+            sw = _apply_insert_xform(bx1, by1, tx, ty, sx, sy, rot)
+            ew = _apply_insert_xform(bx2, by2, tx, ty, sx, sy, rot)
+            pos_segs[pos_key].append((sw, ew))
+
+    for pos_key, segs in pos_segs.items():
+        for chain in _chain_lines_to_outlines(segs, snap_tol=0.1):
+            if len(chain) >= 3:
+                add_outer(chain, OUTER_WALL_LAYER)
 
     return inner_outlines, outer_outlines
 
