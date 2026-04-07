@@ -146,7 +146,10 @@ def collect_annotations(msp):
         z = _parse_z(txt)
         if z is None:
             return
-        layer = ent.dxf.layer
+        try:
+            layer = ent.dxf.layer
+        except Exception:
+            return
         if   any(s.upper() in layer.upper() for s in SPOT_LAYERS):  ann_type = "SPOT"
         elif any(s.upper() in layer.upper() for s in DPC_LAYERS):   ann_type = "DPC"
         elif any(s.upper() in layer.upper() for s in L018_LAYERS):  ann_type = "L018"
@@ -176,7 +179,11 @@ def collect_output_verts(msp):
     """Return list of (x, y, z, layer_type) from 3D_LINES polylines."""
     verts = []
     for ent in msp:
-        if ent.dxf.layer != OUTPUT_LAYER:
+        try:
+            lyr = ent.dxf.layer
+        except Exception:
+            continue
+        if lyr != OUTPUT_LAYER:
             continue
         if ent.dxftype() != "POLYLINE":
             continue
@@ -191,7 +198,10 @@ def collect_input_line_verts(msp):
     """Return list of (x, y, layer_type) from source drive/fence/road geometry."""
     verts = []
     for ent in msp:
-        layer = ent.dxf.layer
+        try:
+            layer = ent.dxf.layer
+        except Exception:
+            continue
         if _suppress(layer):
             continue
         lt = _classify_layer(layer)
@@ -255,7 +265,11 @@ def nearest_building_dist(vx, vy, bldg_verts):
 def collect_building_verts(msp):
     bv = []
     for ent in msp:
-        if not any(bl.upper() in ent.dxf.layer.upper() for bl in BLDG_LAYERS):
+        try:
+            layer = ent.dxf.layer
+        except Exception:
+            continue
+        if not any(bl.upper() in layer.upper() for bl in BLDG_LAYERS):
             continue
         if ent.dxftype() == "LWPOLYLINE":
             bv += [(pt[0], pt[1]) for pt in ent.get_points()]
@@ -273,7 +287,10 @@ def collect_rwall_segments(msp):
     segs = []
     rwall_kw = [r.upper() for r in RWALL_LAYERS]
     for ent in msp:
-        lu = ent.dxf.layer.upper()
+        try:
+            lu = ent.dxf.layer.upper()
+        except Exception:
+            continue
         if not any(kw in lu for kw in rwall_kw):
             continue
         if ent.dxftype() == "LINE":
