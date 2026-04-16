@@ -49,10 +49,10 @@ import numpy as np
 # Multiple aliases per type handle different surveying firm conventions, e.g.:
 #   "LR SPOT LEVEL"         (standard)
 #   "5_E-Spot Levels"       (alternate firm convention)
-SPOT_LAYERS  = ["SPOT LEVEL", "PROP-LEVELS", "EXIST-LEVELS", "PROPOSED LEVEL", "EXT LEVEL", "EXTERNAL LEVEL", "PV LEVEL"]  # matches "LR SPOT LEVEL", "REFA-EXT.W-Prop-Levels", "OEC-Ext Wks - Proposed Levels", "_ENG_Ext Levels", "-m-ec_external levels", "PV LEVEL" (attrib block), etc.
+SPOT_LAYERS  = ["SPOT LEVEL", "PROP-LEVELS", "EXIST-LEVELS", "PROPOSED LEVEL", "EXT LEVEL", "EXTERNAL LEVEL", "EXTERNAL_LEVEL", "PV LEVEL"]  # matches "LR SPOT LEVEL", "REFA-EXT.W-Prop-Levels", "OEC-Ext Wks - Proposed Levels", "_ENG_Ext Levels", "-m-ec_external levels", "PV LEVEL" (attrib block), "1-EXTERNAL_LEVELS", etc.
 DPC_LAYERS   = ["DPC LEVEL", "DPC"]                           # matches "LR DPC LEVEL"
 L018_LAYERS  = ["L018 HA_ANN_FEAT_TEXT"]
-FFL_LAYERS   = ["LLFA FFL", "FINISHED FLOOR", "FFL LEVEL", "FFL"]  # matches "LR LLFA FFL", "_REFA_ FFLs", etc.
+FFL_LAYERS   = ["LLFA FFL", "FINISHED FLOOR", "FINISHED_FLOOR", "FFL LEVEL", "FFL"]  # matches "LR LLFA FFL", "_REFA_ FFLs", "1-HOUSE_FINISHED_FLOOR_LEVEL", etc.
 BLDG_LAYERS  = ["H-PLOT OUTLINE INNER", "H-EXTERNAL WALL", "HOUSE"]
 # Retaining wall geometry layers — used to compute wall-side feature.
 # "RETAINING" matches "P_Retaining Wall *"; "BATTER" matches batter/toe lines;
@@ -103,7 +103,7 @@ def _suppress(layer_name):
 
 
 def _parse_z(text):
-    nums = re.findall(r'[+-]?\d{2,3}\.\d{1,4}', str(text))
+    nums = re.findall(r'[+-]?\d{1,3}\.\d{1,4}', str(text))
     return float(nums[0]) if nums else None
 
 

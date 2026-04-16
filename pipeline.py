@@ -59,8 +59,8 @@ POND_KEYWORDS   = ["pond", "water", "suds", "attenuation", "earthworks"]
 #   "REFA-EXT.W-Prop-Levels"               — contains "PROP-LEVELS"
 #   "REFA-EXT.W-Exist-Levels"              — contains "EXIST-LEVELS"
 #   "_REFA_ FFLs"                           — contains "FFL"
-SPOT_LEVEL_LAYERS = ["SPOT LEVEL", "L018 HA_ANN_FEAT_TEXT", "PROP-LEVELS", "EXIST-LEVELS", "EXT LEVEL", "EXTERNAL LEVEL", "PV LEVEL"]
-FFL_LAYERS        = ["LLFA FFL", "FINISHED FLOOR", "FFL"]
+SPOT_LEVEL_LAYERS = ["SPOT LEVEL", "L018 HA_ANN_FEAT_TEXT", "PROP-LEVELS", "EXIST-LEVELS", "EXT LEVEL", "EXTERNAL LEVEL", "EXTERNAL_LEVEL", "PV LEVEL"]
+FFL_LAYERS        = ["LLFA FFL", "FINISHED FLOOR", "FINISHED_FLOOR", "FFL"]
 DPC_LAYERS        = ["DPC LEVEL"]
 
 # Layers to EXCLUDE from the spot-only terrain point set used for 3D_LINES elevation.
@@ -71,8 +71,8 @@ DPC_LAYERS        = ["DPC LEVEL"]
 SPOT_EXCLUDE_3DLINES = ["L018 HA_ANN_FEAT_TEXT"]
 
 # Regex patterns for elevation text
-ELEVATION_PATTERN = re.compile(r"[+]?\s*(\d{2,3}\.\d{1,4})\s*[+]?")
-FFL_PATTERN       = re.compile(r"FFL[\s\\P]*(\d{2,3}\.\d{1,4})", re.IGNORECASE)
+ELEVATION_PATTERN = re.compile(r"[+]?\s*(\d{1,3}\.\d{1,4})\s*[+]?")
+FFL_PATTERN       = re.compile(r"FFL[\s\\P]*(\d{1,3}\.\d{1,4})", re.IGNORECASE)
 
 # Output layer names (must match reference exactly)
 LAYER_PLOTS_FFL      = "PLOTS FFL"
