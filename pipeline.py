@@ -59,7 +59,7 @@ POND_KEYWORDS   = ["pond", "water", "suds", "attenuation", "earthworks"]
 #   "REFA-EXT.W-Prop-Levels"               — contains "PROP-LEVELS"
 #   "REFA-EXT.W-Exist-Levels"              — contains "EXIST-LEVELS"
 #   "_REFA_ FFLs"                           — contains "FFL"
-SPOT_LEVEL_LAYERS = ["SPOT LEVEL", "L018 HA_ANN_FEAT_TEXT", "PROP-LEVELS", "EXIST-LEVELS", "EXT LEVEL", "EXTERNAL LEVEL", "EXTERNAL_LEVEL", "PV LEVEL"]
+SPOT_LEVEL_LAYERS = ["SPOT LEVEL", "L018 HA_ANN_FEAT_TEXT", "PROP-LEVELS", "EXIST-LEVELS", "EXT LEVEL", "EXTERNAL LEVEL", "EXTERNAL_LEVEL", "EXT_LEVEL", "PV LEVEL"]
 FFL_LAYERS        = ["LLFA FFL", "FINISHED FLOOR", "FINISHED_FLOOR", "FFL"]
 DPC_LAYERS        = ["DPC LEVEL"]
 
