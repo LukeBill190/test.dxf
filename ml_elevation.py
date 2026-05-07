@@ -52,7 +52,7 @@ import numpy as np
 SPOT_LAYERS  = ["SPOT LEVEL", "PROP-LEVELS", "EXIST-LEVELS", "PROPOSED LEVEL", "EXT LEVEL", "EXTERNAL LEVEL", "EXTERNAL_LEVEL", "EXT_LEVEL", "PV LEVEL"]  # matches "LR SPOT LEVEL", "REFA-EXT.W-Prop-Levels", "OEC-Ext Wks - Proposed Levels", "_ENG_Ext Levels", "-m-ec_external levels", "PV LEVEL" (attrib block), "1-EXTERNAL_LEVELS", "ENG_EXT_LEVELS", etc.
 DPC_LAYERS   = ["DPC LEVEL", "DPC"]                           # matches "LR DPC LEVEL"
 L018_LAYERS  = ["L018 HA_ANN_FEAT_TEXT"]
-FFL_LAYERS   = ["LLFA FFL", "FINISHED FLOOR", "FINISHED_FLOOR", "FFL LEVEL", "FFL"]  # matches "LR LLFA FFL", "_REFA_ FFLs", "1-HOUSE_FINISHED_FLOOR_LEVEL", etc.
+FFL_LAYERS   = ["LLFA FFL", "FINISHED FLOOR", "FINISHED_FLOOR", "FFL LEVEL", "SLAB_LEVEL", "FFL"]  # matches "LR LLFA FFL", "_REFA_ FFLs", "1-HOUSE_FINISHED_FLOOR_LEVEL", "ENG_SLAB_LEVELS", etc.
 BLDG_LAYERS  = ["H-PLOT OUTLINE INNER", "H-EXTERNAL WALL", "HOUSE"]
 # Retaining wall geometry layers — used to compute wall-side feature.
 # "RETAINING" matches "P_Retaining Wall *"; "BATTER" matches batter/toe lines;
