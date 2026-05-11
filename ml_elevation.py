@@ -104,7 +104,12 @@ def _suppress(layer_name):
 
 def _parse_z(text):
     nums = re.findall(r'[+-]?\d{1,3}\.\d{1,4}', str(text))
-    return float(nums[0]) if nums else None
+    if not nums:
+        return None
+    val = float(nums[0])
+    if val < 1.0:
+        return None
+    return val
 
 
 def _iter_virtual_deep(insert_entity, max_depth=6):
