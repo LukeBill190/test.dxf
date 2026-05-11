@@ -156,7 +156,7 @@ def collect_annotations(msp):
         except Exception:
             return
         if   any(s.upper() in layer.upper() for s in SPOT_LAYERS):  ann_type = "SPOT"
-        elif any(s.upper() in layer.upper() for s in DPC_LAYERS):   ann_type = "DPC"
+        elif any(s.upper() in layer.upper() for s in DPC_LAYERS):   ann_type = "SPOT"  # DPC collapsed into SPOT
         elif any(s.upper() in layer.upper() for s in L018_LAYERS):  ann_type = "L018"
         elif any(s.upper() in layer.upper() for s in FFL_LAYERS):   ann_type = "FFL"
         else:
