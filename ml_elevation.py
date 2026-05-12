@@ -49,10 +49,10 @@ import numpy as np
 # Multiple aliases per type handle different surveying firm conventions, e.g.:
 #   "LR SPOT LEVEL"         (standard)
 #   "5_E-Spot Levels"       (alternate firm convention)
-SPOT_LAYERS  = ["SPOT LEVEL", "PROP-LEVELS", "EXIST-LEVELS", "PROPOSED LEVEL", "EXT LEVEL", "EXTERNAL LEVEL", "PV LEVEL"]  # matches "LR SPOT LEVEL", "REFA-EXT.W-Prop-Levels", "OEC-Ext Wks - Proposed Levels", "_ENG_Ext Levels", "-m-ec_external levels", "PV LEVEL" (attrib block), etc.
+SPOT_LAYERS  = ["SPOT LEVEL", "PROP-LEVELS", "EXIST-LEVELS", "PROPOSED LEVEL", "EXT LEVEL", "EXTERNAL LEVEL", "EXTERNAL_LEVEL", "EXT_LEVEL", "PV LEVEL"]  # matches "LR SPOT LEVEL", "REFA-EXT.W-Prop-Levels", "OEC-Ext Wks - Proposed Levels", "_ENG_Ext Levels", "-m-ec_external levels", "PV LEVEL" (attrib block), "1-EXTERNAL_LEVELS", "ENG_EXT_LEVELS", etc.
 DPC_LAYERS   = ["DPC LEVEL", "DPC"]                           # matches "LR DPC LEVEL"
 L018_LAYERS  = ["L018 HA_ANN_FEAT_TEXT"]
-FFL_LAYERS   = ["LLFA FFL", "FINISHED FLOOR", "FFL LEVEL", "FFL"]  # matches "LR LLFA FFL", "_REFA_ FFLs", etc.
+FFL_LAYERS   = ["LLFA FFL", "FINISHED FLOOR", "FINISHED_FLOOR", "FFL LEVEL", "SLAB_LEVEL", "FFL"]  # matches "LR LLFA FFL", "_REFA_ FFLs", "1-HOUSE_FINISHED_FLOOR_LEVEL", "ENG_SLAB_LEVELS", etc.
 BLDG_LAYERS  = ["H-PLOT OUTLINE INNER", "H-EXTERNAL WALL", "HOUSE"]
 # Retaining wall geometry layers — used to compute wall-side feature.
 # "RETAINING" matches "P_Retaining Wall *"; "BATTER" matches batter/toe lines;
@@ -103,8 +103,13 @@ def _suppress(layer_name):
 
 
 def _parse_z(text):
-    nums = re.findall(r'[+-]?\d{2,3}\.\d{1,4}', str(text))
-    return float(nums[0]) if nums else None
+    nums = re.findall(r'[+-]?\d{1,3}\.\d{1,4}', str(text))
+    if not nums:
+        return None
+    val = float(nums[0])
+    if val < 1.0:
+        return None
+    return val
 
 
 def _iter_virtual_deep(insert_entity, max_depth=6):
@@ -146,9 +151,12 @@ def collect_annotations(msp):
         z = _parse_z(txt)
         if z is None:
             return
-        layer = ent.dxf.layer
+        try:
+            layer = ent.dxf.layer
+        except Exception:
+            return
         if   any(s.upper() in layer.upper() for s in SPOT_LAYERS):  ann_type = "SPOT"
-        elif any(s.upper() in layer.upper() for s in DPC_LAYERS):   ann_type = "DPC"
+        elif any(s.upper() in layer.upper() for s in DPC_LAYERS):   ann_type = "SPOT"  # DPC collapsed into SPOT
         elif any(s.upper() in layer.upper() for s in L018_LAYERS):  ann_type = "L018"
         elif any(s.upper() in layer.upper() for s in FFL_LAYERS):   ann_type = "FFL"
         else:
@@ -176,7 +184,11 @@ def collect_output_verts(msp):
     """Return list of (x, y, z, layer_type) from 3D_LINES polylines."""
     verts = []
     for ent in msp:
-        if ent.dxf.layer != OUTPUT_LAYER:
+        try:
+            lyr = ent.dxf.layer
+        except Exception:
+            continue
+        if lyr != OUTPUT_LAYER:
             continue
         if ent.dxftype() != "POLYLINE":
             continue
@@ -191,7 +203,10 @@ def collect_input_line_verts(msp):
     """Return list of (x, y, layer_type) from source drive/fence/road geometry."""
     verts = []
     for ent in msp:
-        layer = ent.dxf.layer
+        try:
+            layer = ent.dxf.layer
+        except Exception:
+            continue
         if _suppress(layer):
             continue
         lt = _classify_layer(layer)
@@ -255,7 +270,11 @@ def nearest_building_dist(vx, vy, bldg_verts):
 def collect_building_verts(msp):
     bv = []
     for ent in msp:
-        if not any(bl.upper() in ent.dxf.layer.upper() for bl in BLDG_LAYERS):
+        try:
+            layer = ent.dxf.layer
+        except Exception:
+            continue
+        if not any(bl.upper() in layer.upper() for bl in BLDG_LAYERS):
             continue
         if ent.dxftype() == "LWPOLYLINE":
             bv += [(pt[0], pt[1]) for pt in ent.get_points()]
@@ -273,7 +292,10 @@ def collect_rwall_segments(msp):
     segs = []
     rwall_kw = [r.upper() for r in RWALL_LAYERS]
     for ent in msp:
-        lu = ent.dxf.layer.upper()
+        try:
+            lu = ent.dxf.layer.upper()
+        except Exception:
+            continue
         if not any(kw in lu for kw in rwall_kw):
             continue
         if ent.dxftype() == "LINE":
