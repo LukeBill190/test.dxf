@@ -40,8 +40,8 @@ except ImportError:
 # Layer patterns that identify building plot outlines (case-insensitive substring)
 # NOTE: party-wall layers are excluded here — they are used only to suppress those
 # entities from 3D_LINES, not as a source of plot outline geometry.
-BUILDING_OUTLINE_LAYERS = ["PLOT OUTLINE INNER"]   # source for pad geometry only (inner face)
-OUTER_WALL_LAYER        = "H-EXTERNAL WALL"        # outer wall face — used directly where available
+BUILDING_OUTLINE_LAYERS = ["PLOT OUTLINE INNER", "PLOT OUTLINE"]   # source for pad geometry only (inner face)
+OUTER_WALL_LAYERS       = ["H-EXTERNAL WALL", "HOUSE_EXTERNAL_WALL", "EXTERNAL WALL"]
 BUILDING_KEYWORDS       = ["plot", "building", "house", "garage"]
 BUILDING_SUPPRESS_LAYERS = ["EXTERNAL PARTY WALL"]  # exclude from 3D_LINES but not pads
 
@@ -126,6 +126,14 @@ def _is_pad_source_layer(layer_name):
         if pat.upper() in lu:
             return True
     return False
+
+
+def _is_outer_wall_layer(layer_name):
+    """True if this layer is the source of outer wall face geometry."""
+    lu = layer_name.upper()
+    if "INTERNAL" in lu or "PARTY" in lu:
+        return False
+    return any(pat.upper() in lu for pat in OUTER_WALL_LAYERS)
 
 
 def _classify_layer_ml(layer_name):
@@ -1017,7 +1025,7 @@ def _block_outline_verts(doc, insert_entity):
                 lyr = ""
 
             is_inner  = _is_pad_source_layer(lyr)
-            is_outer  = OUTER_WALL_LAYER.upper() in lyr.upper()
+            is_outer  = _is_outer_wall_layer(lyr)
             is_party352 = ("EXTERNAL PARTY WALL 352" in lyr.upper())
             # H-EXTERNAL PARTY WALL (non-352) LINEs close the outline for MID inner blocks
             is_party  = ("EXTERNAL PARTY WALL" in lyr.upper()
@@ -1182,7 +1190,7 @@ def collect_building_outlines(msp, doc):
         lyr = entity.dxf.layer
         if _is_pad_source_layer(lyr):
             add_inner([(x, y) for x, y, *_ in entity.get_points()], lyr)
-        elif OUTER_WALL_LAYER.upper() in lyr.upper():
+        elif _is_outer_wall_layer(lyr):
             add_outer([(x, y) for x, y, *_ in entity.get_points()], lyr)
 
     # Geometry inside INSERT blocks
@@ -1193,7 +1201,7 @@ def collect_building_outlines(msp, doc):
         for verts in inner_verts_list:
             add_inner(verts, BUILDING_OUTLINE_LAYERS[0])
         for verts in outer_verts_list:
-            add_outer(verts, OUTER_WALL_LAYER)
+            add_outer(verts, OUTER_WALL_LAYERS[0])
 
     return inner_outlines, outer_outlines
 
