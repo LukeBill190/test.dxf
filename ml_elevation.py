@@ -267,6 +267,44 @@ def nearest_building_dist(vx, vy, bldg_verts):
     return min(math.sqrt((bx - vx) ** 2 + (by - vy) ** 2) for bx, by in bldg_verts)
 
 
+# ---------------------------------------------------------------------------
+# TIN baseline surface
+# ---------------------------------------------------------------------------
+
+def build_ann_tin(ann_by_type):
+    """
+    Build a LinearNDInterpolator TIN surface from SPOT + L018 annotations
+    (terrain-level points; FFL is excluded as it sits above external ground).
+
+    Returns a callable tin(x, y) -> z (nan outside hull), or None when scipy
+    is unavailable or there are too few / degenerate points.
+    """
+    pts = [(a[0], a[1], a[2]) for t in ("SPOT", "L018")
+           for a in ann_by_type.get(t, [])]
+    if len(pts) < 3:
+        return None
+    try:
+        from scipy.interpolate import LinearNDInterpolator
+        xy = np.array([(p[0], p[1]) for p in pts])
+        z  = np.array([p[2] for p in pts])
+        return LinearNDInterpolator(xy, z)
+    except Exception:
+        return None
+
+
+_tin_cache = {}
+
+def _get_tin_cached(ann_by_type):
+    """Per-project TIN cache keyed by the ann_by_type dict identity (built once
+    per pipeline run, so identity is stable across per-polyline predict calls)."""
+    key = id(ann_by_type)
+    if key not in _tin_cache:
+        if len(_tin_cache) > 8:
+            _tin_cache.clear()
+        _tin_cache[key] = build_ann_tin(ann_by_type)
+    return _tin_cache[key]
+
+
 def collect_building_verts(msp):
     bv = []
     for ent in msp:
@@ -318,20 +356,63 @@ def collect_rwall_segments(msp):
     return segs
 
 
+N_SIDE_SPOTS = 3   # spots per wall side used for the median z-offset
+
+def wall_open_endpoints(rwall_segs, snap=0.05):
+    """
+    Return [(x, y), ...] of degree-1 wall segment endpoints — i.e. true wall
+    ends where the retained level transitions back to grade.  Interior polyline
+    vertices are shared by two segments and are excluded via the degree count.
+    """
+    from collections import Counter
+    counts = Counter()
+    for (x1, y1), (x2, y2) in rwall_segs:
+        counts[(round(x1 / snap), round(y1 / snap))] += 1
+        counts[(round(x2 / snap), round(y2 / snap))] += 1
+    return [(kx * snap, ky * snap) for (kx, ky), n in counts.items() if n == 1]
+
+
+_wall_end_cache = {}
+
+def _get_wall_endpoints_cached(rwall_segs):
+    key = id(rwall_segs)
+    if key not in _wall_end_cache:
+        if len(_wall_end_cache) > 8:
+            _wall_end_cache.clear()
+        _wall_end_cache[key] = wall_open_endpoints(rwall_segs)
+    return _wall_end_cache[key]
+
+
+def _segs_cross(p1, p2, q1, q2):
+    """True if open segments p1-p2 and q1-q2 properly intersect."""
+    def orient(a, b, c):
+        v = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+        return 0 if abs(v) < 1e-12 else (1 if v > 0 else -1)
+    o1, o2 = orient(p1, p2, q1), orient(p1, p2, q2)
+    o3, o4 = orient(q1, q2, p1), orient(q1, q2, p2)
+    return o1 != o2 and o3 != o4 and 0 not in (o1, o2, o3, o4)
+
+
 def wall_side_feature(vx, vy, rwall_segs, all_spots, site_median_z, radius=FEAT_RADIUS):
     """
-    Return (wall_dist, wall_same_z_off, wall_opp_z_off) for the nearest wall segment.
+    Return (wall_dist, wall_same_z_off, wall_opp_z_off, wall_end_dist, crosses_wall)
+    for the nearest wall segment.
 
     wall_dist       : XY distance to nearest wall segment (capped at radius)
-    wall_same_z_off : z-offset of the nearest spot level on the SAME side of the
-                      nearest wall as the vertex (relative to site_median_z)
-    wall_opp_z_off  : z-offset of the nearest spot level on the OPPOSITE side
+    wall_same_z_off : median z-offset of the N_SIDE_SPOTS nearest spot levels on
+                      the SAME side of the nearest wall as the vertex
+    wall_opp_z_off  : same for the OPPOSITE side
+    wall_end_dist   : XY distance to the nearest open wall endpoint (capped at
+                      radius) — elevation transitions happen at wall ends
+    crosses_wall    : 1.0 if the straight line from the vertex to its nearest
+                      spot level crosses a wall segment (that spot references
+                      the wrong side of the retaining structure), else 0.0
 
-    This avoids the signed-distance ambiguity (which depends on polyline draw direction)
-    by working in z-space: the model learns "target ≈ wall_same_z_off" regardless of
-    which side is geometrically "positive".
+    Medians (rather than the single nearest spot) make the side levels robust
+    to one mislabelled annotation.  This avoids the signed-distance ambiguity
+    (which depends on polyline draw direction) by working in z-space.
 
-    All three are zeroed (wall_dist=radius, z_offs=0) when no wall is nearby.
+    Zeroed / capped defaults are returned when no wall or spots are nearby.
     """
     # Find nearest wall segment and store its geometry for side classification
     best_dist = radius
@@ -352,29 +433,55 @@ def wall_side_feature(vx, vy, rwall_segs, all_spots, site_median_z, radius=FEAT_
             found_wall = True
 
     if not found_wall or not all_spots:
-        return best_dist, 0.0, 0.0
+        return best_dist, 0.0, 0.0, radius, 0.0
+
+    # Distance to nearest open wall endpoint
+    wall_end_dist = radius
+    for ex, ey in _get_wall_endpoints_cached(rwall_segs):
+        d = math.sqrt((ex - vx) ** 2 + (ey - vy) ** 2)
+        if d < wall_end_dist:
+            wall_end_dist = d
 
     # Sign of vertex relative to nearest wall (cross product of wall dir × vertex offset)
     vertex_cross = best_dx * (vy - best_y1) - best_dy * (vx - best_x1)
 
-    # Split spots into same-side and opposite-side; pick nearest of each
-    same_best = (radius, float('nan'))
-    opp_best  = (radius, float('nan'))
+    # Split spots into same-side / opposite-side lists of (dist, z);
+    # also track the overall nearest spot for the wall-crossing test.
+    same_side, opp_side = [], []
+    nearest_spot = None
+    nearest_spot_d = radius
     for ax, ay, az, _ in all_spots:
         d = math.sqrt((ax - vx) ** 2 + (ay - vy) ** 2)
+        if d < nearest_spot_d:
+            nearest_spot_d = d
+            nearest_spot = (ax, ay)
         if d >= radius:
             continue
         spot_cross = best_dx * (ay - best_y1) - best_dy * (ax - best_x1)
         if vertex_cross * spot_cross >= 0:   # same side (or on wall)
-            if d < same_best[0]:
-                same_best = (d, az)
+            same_side.append((d, az))
         else:
-            if d < opp_best[0]:
-                opp_best = (d, az)
+            opp_side.append((d, az))
 
-    same_z_off = (same_best[1] - site_median_z) if not math.isnan(same_best[1]) else 0.0
-    opp_z_off  = (opp_best[1]  - site_median_z) if not math.isnan(opp_best[1])  else 0.0
-    return best_dist, same_z_off, opp_z_off
+    def _median_z_off(side):
+        if not side:
+            return 0.0
+        side.sort()
+        zs = sorted(z for _, z in side[:N_SIDE_SPOTS])
+        return zs[len(zs) // 2] - site_median_z
+
+    same_z_off = _median_z_off(same_side)
+    opp_z_off  = _median_z_off(opp_side)
+
+    # Does the line from vertex to its nearest spot cross a wall?
+    crosses = 0.0
+    if nearest_spot is not None:
+        for seg in rwall_segs:
+            if _segs_cross((vx, vy), nearest_spot, seg[0], seg[1]):
+                crosses = 1.0
+                break
+
+    return best_dist, same_z_off, opp_z_off, wall_end_dist, crosses
 
 
 # ---------------------------------------------------------------------------
@@ -390,7 +497,9 @@ def _feature_names():
         for k in range(1, N_NEAR + 1):
             names += [f"{at}_dist_{k}", f"{at}_z_off_{k}"]
     names.append("bldg_dist")
-    names += ["wall_dist", "wall_same_z_off", "wall_opp_z_off"]
+    names += ["wall_dist", "wall_same_z_off", "wall_opp_z_off",
+              "wall_end_dist", "crosses_wall"]
+    names += ["tin_ok", "tin_z_off", "tin_resid"]
     return names
 
 
@@ -399,7 +508,7 @@ N_FEATURES    = len(FEATURE_NAMES)
 
 
 def extract_features(vx, vy, layer_type, ann_by_type, bldg_verts, site_median_z,
-                     rwall_segs=None):
+                     rwall_segs=None, tin=None):
     """
     Build the feature vector for a single vertex.
 
@@ -411,6 +520,8 @@ def extract_features(vx, vy, layer_type, ann_by_type, bldg_verts, site_median_z,
     bldg_verts     : list[(x,y)] — building outline vertices
     site_median_z  : float — median Z of all terrain annotations for this project
     rwall_segs     : list[((x1,y1),(x2,y2))] | None — retaining wall segments
+    tin            : callable(x, y) -> z | None — TIN baseline surface built
+                     from SPOT+L018 annotations (see build_ann_tin)
     """
     enc = LAYER_ENC.get(layer_type, 1)
     feat = [
@@ -419,18 +530,42 @@ def extract_features(vx, vy, layer_type, ann_by_type, bldg_verts, site_median_z,
         1.0 if enc == 2 else 0.0,   # is_road
     ]
     all_spots = ann_by_type.get("SPOT", [])
+    nearest_spot_z = float('nan')
     for at in ANN_TYPES:
         pairs = nearest_k(vx, vy, ann_by_type.get(at, []), N_NEAR, FEAT_RADIUS)
+        if at == "SPOT" and pairs:
+            nearest_spot_z = pairs[0][1]
         for dist, z in pairs:
             z_off = (z - site_median_z) if not math.isnan(z) else 0.0
             feat.append(dist)
             feat.append(z_off)
     feat.append(nearest_building_dist(vx, vy, bldg_verts))
-    wd, wsame, wopp = wall_side_feature(vx, vy, rwall_segs or [], all_spots,
-                                        site_median_z)
+    wd, wsame, wopp, wend, wcross = wall_side_feature(
+        vx, vy, rwall_segs or [], all_spots, site_median_z)
     feat.append(wd)
     feat.append(wsame)
     feat.append(wopp)
+    feat.append(wend)
+    feat.append(wcross)
+
+    # TIN baseline: the natural terrain-surface estimate at this vertex.
+    # tin_ok distinguishes "offset genuinely 0" from "no TIN data here".
+    tin_ok = 0.0
+    tin_z_off = 0.0
+    tin_resid = 0.0
+    if tin is not None:
+        try:
+            tz = float(tin(vx, vy))
+        except Exception:
+            tz = float('nan')
+        if not math.isnan(tz):
+            tin_ok = 1.0
+            tin_z_off = tz - site_median_z
+            if not math.isnan(nearest_spot_z):
+                tin_resid = tz - nearest_spot_z
+    feat.append(tin_ok)
+    feat.append(tin_z_off)
+    feat.append(tin_resid)
     return feat
 
 
@@ -479,6 +614,9 @@ def extract_pair(input_dxf_path, output_dxf_path, project_name="?"):
     # --- Collect retaining wall segments for wall-side feature ---
     rwall_segs = collect_rwall_segments(in_msp)
 
+    # --- Build TIN baseline surface from terrain annotations ---
+    tin = build_ann_tin(ann_by_type)
+
     # --- Collect source line vertices to infer layer type at each output vertex ---
     src_line_verts = collect_input_line_verts(in_msp)  # (x, y, layer_type)
 
@@ -525,7 +663,7 @@ def extract_pair(input_dxf_path, output_dxf_path, project_name="?"):
             continue
         lt = infer_layer_type(vx, vy)
         feat = extract_features(vx, vy, lt, ann_by_type, bldg_verts, site_median,
-                                rwall_segs=rwall_segs)
+                                rwall_segs=rwall_segs, tin=tin)
         features.append(feat)
         targets.append(vz - site_median)
         n_owned += 1
@@ -686,9 +824,10 @@ def predict_z_batch(verts_2d, layer_type, ann_by_type, bldg_verts, site_median_z
     list of float — predicted Z for each vertex
     """
     model = model_payload["model"]
+    tin = _get_tin_cached(ann_by_type)
     X = np.array([
         extract_features(vx, vy, layer_type, ann_by_type, bldg_verts, site_median_z,
-                         rwall_segs=rwall_segs)
+                         rwall_segs=rwall_segs, tin=tin)
         for vx, vy in verts_2d
     ], dtype=np.float32)
     z_offsets = model.predict(X)
