@@ -145,7 +145,15 @@ def collect_annotations(msp):
         except Exception:
             return
         try:
-            txt = ent.text if ent.dxftype() == "MTEXT" else ent.dxf.text
+            if ent.dxftype() == "MTEXT":
+                # plain_text() strips inline formatting codes like \W1.00;
+                # whose numbers would otherwise be parsed as elevations.
+                try:
+                    txt = ent.plain_text()
+                except Exception:
+                    txt = ent.text
+            else:
+                txt = ent.dxf.text
         except Exception:
             return
         z = _parse_z(txt)
