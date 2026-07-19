@@ -41,7 +41,7 @@ except ImportError:
 # NOTE: party-wall layers are excluded here — they are used only to suppress those
 # entities from 3D_LINES, not as a source of plot outline geometry.
 BUILDING_OUTLINE_LAYERS = ["PLOT OUTLINE INNER", "PLOT OUTLINE"]   # source for pad geometry only (inner face)
-OUTER_WALL_LAYERS       = ["H-EXTERNAL WALL", "HOUSE_EXTERNAL_WALL", "EXTERNAL WALL"]
+OUTER_WALL_LAYERS       = ["H-EXTERNAL WALL", "HOUSE_EXTERNAL_WALL", "EXTERNAL WALL", "HT-WALL-STRUCTURE"]
 BUILDING_KEYWORDS       = ["plot", "building", "house", "garage"]
 BUILDING_SUPPRESS_LAYERS = ["EXTERNAL PARTY WALL"]  # exclude from 3D_LINES but not pads
 
